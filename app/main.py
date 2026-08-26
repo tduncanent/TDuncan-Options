@@ -467,6 +467,18 @@ def get_tastytrade_quote_price(quote):
     return 0.0
 
 
+def get_tastytrade_quote_open_price(quote):
+    if not isinstance(quote, dict):
+        return 0.0
+
+    for field_name in ["open", "open-price", "open_price", "day-open-price"]:
+        value = safe_float(quote.get(field_name), 0.0)
+        if value > 0:
+            return value
+
+    return 0.0
+
+
 def calculate_tastytrade_spread_flag(short_quote, long_quote, credit, bid_ask_width):
     if not short_quote or not long_quote:
         return "Missing quote"
@@ -496,6 +508,7 @@ def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, sel
         symbol = str(symbol).upper().strip()
         underlying_quote = equity_quotes.get(symbol, {})
         current_price = get_tastytrade_quote_price(underlying_quote)
+        open_price = get_tastytrade_quote_open_price(underlying_quote)
 
         chain_data, chain_error = fetch_tastytrade_nested_option_chain(symbol)
 
@@ -629,8 +642,10 @@ def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, sel
 
                 if spread["side"] == "Put Credit":
                     distance_from_price = round(current_price - spread["short_strike"], 4) if current_price else 0.0
+                    distance_from_open = round(open_price - spread["short_strike"], 4) if open_price else None
                 else:
                     distance_from_price = round(spread["short_strike"] - current_price, 4) if current_price else 0.0
+                    distance_from_open = round(spread["short_strike"] - open_price, 4) if open_price else None
 
                 bid_ask_width = round(max(short_ask - short_bid, 0) + max(long_ask - long_bid, 0), 4)
                 flag = calculate_tastytrade_spread_flag(short_quote, long_quote, natural_credit, bid_ask_width)
@@ -657,6 +672,8 @@ def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, sel
                     "Flag": flag,
                     "Short Symbol": spread["short_symbol"],
                     "Long Symbol": spread["long_symbol"],
+                    "_Open Price": round(open_price, 4) if open_price else None,
+                    "_Distance From Open": distance_from_open,
                 })
 
     board_rows = sorted(
@@ -825,6 +842,101 @@ def apply_options_credit_range_filter(board_rows, credit_filter):
         filtered_rows.append(row)
 
     return filtered_rows
+
+
+def format_options_number(value):
+    number = safe_float(value, None)
+
+    if number is None:
+        return "—"
+
+    if abs(number - round(number)) < 0.000001:
+        return str(int(round(number)))
+
+    return f"{number:.4f}".rstrip("0").rstrip(".")
+
+
+def get_public_options_rows(board_rows):
+    return [
+        {
+            key: value
+            for key, value in row.items()
+            if not str(key).startswith("_")
+        }
+        for row in board_rows
+    ]
+
+
+def select_farthest_instant_credit_row(board_rows, symbol, side):
+    candidates = []
+
+    for row in board_rows:
+        if row.get("Symbol") != symbol or row.get("Side") != side:
+            continue
+
+        natural_credit = safe_float(row.get("Instant Credit"), 0.0)
+        distance_from_open = safe_float(row.get("_Distance From Open"), None)
+
+        if natural_credit <= 0 or distance_from_open is None or distance_from_open < 0:
+            continue
+
+        candidates.append(row)
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda row: (
+            safe_float(row.get("_Distance From Open"), 0.0),
+            safe_float(row.get("Instant Credit"), 0.0),
+            safe_float(row.get("Width"), 0.0),
+        ),
+    )
+
+
+def render_instant_credit_calculations(board_rows, selected_symbols):
+    st.markdown("---")
+    st.subheader("Instant Credit Calculations")
+    st.caption(
+        "For each selected symbol, this shows the farthest Call and Put spread from today's open "
+        "that has a positive natural credit (short bid minus long ask)."
+    )
+
+    for symbol in selected_symbols:
+        st.markdown(f"### {symbol} Instant Credits")
+        summary_rows = []
+
+        for side, type_label in [("Call Credit", "CALL"), ("Put Credit", "PUT")]:
+            best_row = select_farthest_instant_credit_row(board_rows, symbol, side)
+
+            if not best_row:
+                continue
+
+            summary_rows.append({
+                "TYPE": type_label,
+                "STRIKES": (
+                    f'{format_options_number(best_row.get("Short Strike"))} - '
+                    f'{format_options_number(best_row.get("Long Strike"))}'
+                ),
+                "DISTANCE FROM OPEN": format_options_number(best_row.get("_Distance From Open")),
+                "INSTANT CREDIT": f'{safe_float(best_row.get("Instant Credit"), 0.0):.2f}',
+            })
+
+        if summary_rows:
+            st.dataframe(
+                summary_rows,
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            symbol_rows = [row for row in board_rows if row.get("Symbol") == symbol]
+            open_is_available = any(safe_float(row.get("_Open Price"), 0.0) > 0 for row in symbol_rows)
+
+            if symbol_rows and not open_is_available:
+                st.info(f"{symbol}: today's opening price was unavailable, so distance-from-open calculations could not be completed.")
+            else:
+                st.info(f"{symbol}: no instant-credit Call or Put spread is available for the current selections.")
 
 def render_options_opportunity_board():
     st.markdown(
@@ -1020,10 +1132,12 @@ def render_options_opportunity_board():
         return
 
     st.dataframe(
-        visible_board_rows,
+        get_public_options_rows(visible_board_rows),
         use_container_width=True,
         hide_index=True,
     )
+
+    render_instant_credit_calculations(visible_board_rows, selected_symbols)
 
 
 render_options_opportunity_board()
