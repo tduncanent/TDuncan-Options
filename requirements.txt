@@ -1,2 +1,3 @@
 streamlit
 requests
+tastytrade==13.2.3

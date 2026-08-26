@@ -1,7 +1,10 @@
+import asyncio
 import re
 import time
-from datetime import datetime
+from datetime import datetime, time as clock_time, timedelta
+from zoneinfo import ZoneInfo
 
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -56,6 +59,647 @@ def safe_float(value, default=0.0):
 
     except Exception:
         return default
+
+
+# ==================================================
+# LIVE TECHNICAL ENTRY CHECK — TASTYTRADE CANDLES
+# ==================================================
+
+EASTERN_ZONE = ZoneInfo("America/New_York")
+LIVE_TECHNICAL_SYMBOLS = ["QQQ", "SPY", "XSP", "XND"]
+LIVE_REVIEW_TIMES = {
+    "11:00 AM": clock_time(11, 0),
+    "1:00 PM": clock_time(13, 0),
+    "2:15 PM": clock_time(14, 15),
+}
+
+# This is the Foundational Golden Filter subset used by the Research Engine.
+# Keeping it here makes the live page deployable as a single Streamlit file.
+LIVE_FOUNDATIONAL_RULES = {
+    "QQQ": {
+        "standard_distance": 20.0,
+        "preferred_distance": 25.0,
+        "closer_distance": 15.0,
+        "near_extreme_percent": 0.30,
+        "11:00 AM": {"impulse": 3.20, "atr": 5.00, "churn": 11.90, "displacement": 4.00},
+        "1:00 PM": {
+            "impulse": 3.20,
+            "atr": 5.00,
+            "churn": 11.90,
+            "displacement": 4.00,
+            "persistent_trend": 15.00,
+        },
+        "2:15 PM": {
+            "impulse": 3.20,
+            "atr": 5.00,
+            "churn": 11.90,
+            "displacement": 4.00,
+            "persistent_trend": 15.00,
+        },
+    },
+    "SPY": {
+        "standard_distance": 12.5,
+        "preferred_distance": 15.0,
+        "closer_distance": 10.0,
+        "near_extreme_percent": 0.30,
+        "11:00 AM": {"impulse": 3.25, "atr": 2.30, "churn": 6.00, "displacement": 2.00},
+        "1:00 PM": {"impulse": 3.50, "atr": 3.10, "churn": 4.00, "displacement": 5.00},
+        "2:15 PM": {"impulse": 2.25, "atr": 2.30, "churn": 3.00, "displacement": 10.00},
+    },
+    "XSP": {
+        "standard_distance": 15.0,
+        "preferred_distance": 16.0,
+        "closer_distance": 10.0,
+        "near_extreme_percent": 0.30,
+        "11:00 AM": {
+            "impulse": 3.30,
+            "atr": 2.25,
+            "churn": 7.75,
+            "displacement": 4.25,
+            "combined_activity_gate": True,
+        },
+        "1:00 PM": {
+            "impulse": 3.20,
+            "atr": 2.80,
+            "churn": 5.25,
+            "displacement": 4.00,
+            "persistent_trend": 9.00,
+        },
+        "2:15 PM": {
+            "impulse": 4.00,
+            "atr": 2.60,
+            "churn": 3.50,
+            "displacement": 4.00,
+            "persistent_trend": 9.00,
+        },
+    },
+    "XND": {
+        "standard_distance": 6.0,
+        "preferred_distance": 7.0,
+        "closer_distance": 5.0,
+        "near_extreme_percent": 0.30,
+        "11:00 AM": {"impulse": 1.25, "atr": 2.25, "churn": 1.00, "displacement": 4.50},
+        "1:00 PM": {"impulse": 2.00, "atr": 1.25, "churn": 1.50, "displacement": 3.00},
+        "2:15 PM": {"impulse": 1.75, "atr": 1.50, "churn": 1.50, "displacement": 3.50},
+    },
+}
+
+
+def default_live_review_label(now_et):
+    if now_et.time() >= LIVE_REVIEW_TIMES["2:15 PM"]:
+        return "2:15 PM"
+    if now_et.time() >= LIVE_REVIEW_TIMES["1:00 PM"]:
+        return "1:00 PM"
+    return "11:00 AM"
+
+
+def live_review_timestamp(trade_date, review_label):
+    return datetime.combine(
+        trade_date,
+        LIVE_REVIEW_TIMES[review_label],
+        tzinfo=EASTERN_ZONE,
+    )
+
+
+def format_live_clock(value, include_seconds=False):
+    hour = value.strftime("%I").lstrip("0") or "0"
+    minute_second = value.strftime(":%M:%S" if include_seconds else ":%M")
+    return f"{hour}{minute_second} {value.strftime('%p %Z')}".strip()
+
+
+def live_near_extreme(price, low, high, percent):
+    span = high - low
+
+    if span <= 0:
+        return True
+
+    return price <= low + span * percent or price >= high - span * percent
+
+
+def build_live_15m_candles(one_minute_candles):
+    if one_minute_candles.empty:
+        return pd.DataFrame()
+
+    indexed = one_minute_candles.set_index("timestamp_et")
+    bars = indexed.resample(
+        "15min",
+        origin="start_day",
+        offset="30min",
+        label="left",
+        closed="left",
+    ).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        source_minutes=("close", "count"),
+    )
+    bars = bars.dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+    if bars.empty:
+        return bars
+
+    bars["trade_date"] = bars["timestamp_et"].dt.date
+    bars = bars.sort_values("timestamp_et")
+    previous_close = bars["close"].shift(1)
+    true_range = pd.concat(
+        [
+            bars["high"] - bars["low"],
+            (bars["high"] - previous_close).abs(),
+            (bars["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    bars["true_range"] = true_range
+    bars["atr_14"] = true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    return bars.reset_index(drop=True)
+
+
+def select_live_review_window(day_15m, review_label):
+    clocks = day_15m["timestamp_et"].dt.time
+
+    if review_label == "11:00 AM":
+        recent = day_15m[(clocks >= clock_time(9, 30)) & (clocks < clock_time(11, 0))].copy()
+        full = recent.copy()
+    elif review_label == "1:00 PM":
+        recent = day_15m[(clocks >= clock_time(11, 30)) & (clocks < clock_time(13, 0))].copy()
+        full = day_15m[(clocks >= clock_time(9, 30)) & (clocks < clock_time(13, 0))].copy()
+    else:
+        recent = day_15m[(clocks >= clock_time(12, 45)) & (clocks < clock_time(14, 15))].copy()
+        full = day_15m[(clocks >= clock_time(9, 30)) & (clocks < clock_time(14, 15))].copy()
+
+    return recent, full
+
+
+def evaluate_live_technical_review(symbol, day_1m, day_15m, trade_date, review_label):
+    cutoff = live_review_timestamp(trade_date, review_label)
+    visible = day_1m[day_1m["timestamp_et"] < cutoff].copy()
+
+    if visible.empty:
+        return {"ready": False, "message": "No regular-session candles are available for this review."}
+
+    first_timestamp = visible.iloc[0]["timestamp_et"]
+    if first_timestamp.time() != clock_time(9, 30):
+        return {
+            "ready": False,
+            "message": "The 9:30 AM opening candle is missing, so the fixed opening price cannot be verified.",
+        }
+
+    recent, full = select_live_review_window(day_15m, review_label)
+    if recent.empty or len(recent) < 6:
+        return {
+            "ready": False,
+            "message": f"The {review_label} review needs six completed 15-minute candles.",
+        }
+
+    recent = recent.tail(6).copy()
+    if "source_minutes" in recent and (recent["source_minutes"] < 15).any():
+        return {
+            "ready": False,
+            "message": (
+                f"The {review_label} candle set is still incomplete or has a one-minute data gap. "
+                "Wait briefly, then rerun the live check."
+            ),
+        }
+
+    atr = recent.iloc[-1]["atr_14"]
+    if pd.isna(atr):
+        return {
+            "ready": False,
+            "message": "ATR(14) is unavailable because the live history did not include enough warm-up candles.",
+        }
+
+    rules = LIVE_FOUNDATIONAL_RULES[symbol]
+    thresholds = rules[review_label]
+    market_open = float(visible.iloc[0]["open"])
+    review_price = float(recent.iloc[-1]["close"])
+    signed_move = review_price - market_open
+    move = abs(signed_move)
+    bodies = (recent["close"] - recent["open"]).abs()
+    max_body = float(bodies.max())
+    churn = float(bodies.sum())
+    near_recent = live_near_extreme(
+        review_price,
+        float(recent["low"].min()),
+        float(recent["high"].max()),
+        rules["near_extreme_percent"],
+    )
+    near_full = live_near_extreme(
+        review_price,
+        float(full["low"].min()),
+        float(full["high"].max()),
+        rules["near_extreme_percent"],
+    )
+
+    inclusive = symbol in {"XND"}
+    atr_inclusive = symbol in {"SPY", "XND"}
+    churn_inclusive = symbol in {"SPY", "XND"}
+    impulse_triggered = max_body >= thresholds["impulse"] if inclusive else max_body > thresholds["impulse"]
+    atr_threshold_met = float(atr) >= thresholds["atr"] if atr_inclusive else float(atr) > thresholds["atr"]
+    combined_activity_gate = bool(thresholds.get("combined_activity_gate"))
+    atr_triggered = atr_threshold_met and not combined_activity_gate
+    churn_threshold_met = churn >= thresholds["churn"] if churn_inclusive else churn > thresholds["churn"]
+    displacement_threshold_met = move >= thresholds["displacement"] if churn_inclusive else move > thresholds["displacement"]
+    churn_triggered = churn_threshold_met and (
+        displacement_threshold_met or (combined_activity_gate and atr_threshold_met)
+    )
+
+    triggers = []
+    if impulse_triggered and near_recent:
+        comparison = ">=" if inclusive else ">"
+        triggers.append(
+            f"Large impulse still holding: body {max_body:.2f} {comparison} "
+            f"{thresholds['impulse']:.2f}, with price near the recent extreme."
+        )
+    if atr_triggered:
+        comparison = ">=" if atr_inclusive else ">"
+        triggers.append(f"Extreme ATR: {float(atr):.2f} {comparison} {thresholds['atr']:.2f}.")
+    if churn_triggered and combined_activity_gate:
+        if displacement_threshold_met:
+            qualifying_context = f"movement {move:.2f} > {thresholds['displacement']:.2f}"
+        else:
+            qualifying_context = f"ATR {float(atr):.2f} > {thresholds['atr']:.2f}"
+        triggers.append(
+            f"Exceptional activity: churn {churn:.2f} > {thresholds['churn']:.2f} "
+            f"with {qualifying_context}."
+        )
+    elif churn_triggered:
+        comparison = ">=" if churn_inclusive else ">"
+        triggers.append(
+            f"Heavy churn plus displacement: churn {churn:.2f} {comparison} "
+            f"{thresholds['churn']:.2f} and move {move:.2f} {comparison} "
+            f"{thresholds['displacement']:.2f}."
+        )
+
+    persistent = thresholds.get("persistent_trend")
+    if persistent is not None and move >= persistent and near_full:
+        triggers.append(
+            f"Persistent aggressive trend: move {move:.2f} >= {persistent:.2f}, "
+            "with price near the full-session extreme."
+        )
+
+    flagged = bool(triggers)
+    if flagged and review_label == "11:00 AM":
+        decision = "WAIT UNTIL 1:00 PM"
+    elif flagged and review_label == "1:00 PM":
+        decision = "WAIT UNTIL 2:15 PM"
+    elif flagged:
+        decision = "SKIP THE DAY"
+    else:
+        decision = "CLEAR TO ENTER"
+
+    return {
+        "ready": True,
+        "flagged": flagged,
+        "decision": decision,
+        "market_open": market_open,
+        "review_price": review_price,
+        "signed_move": signed_move,
+        "move_from_open": move,
+        "atr": float(atr),
+        "reasons": triggers if triggers else ["No technical danger rule triggered."],
+        "metrics": {
+            "max_body": max_body,
+            "churn": churn,
+            "near_recent_extreme": near_recent,
+            "near_full_extreme": near_full,
+            "persistent_threshold": persistent,
+        },
+        "recent_bars": recent,
+    }
+
+
+async def download_tastytrade_candle_events(symbol, start_time):
+    try:
+        from tastytrade import DXLinkStreamer, Session
+        from tastytrade.dxfeed import Candle
+        from tastytrade.instruments import Equity
+    except ImportError as exc:
+        raise RuntimeError(
+            "The tastytrade candle package is not installed. Add tastytrade==13.2.3 to requirements.txt."
+        ) from exc
+
+    provider_secret = get_tastytrade_secret_value("client_secret")
+    refresh_token = get_tastytrade_secret_value("refresh_token")
+    if not provider_secret or not refresh_token:
+        raise RuntimeError("Tastytrade client_secret and refresh_token must be loaded in Streamlit Secrets.")
+
+    streamer_symbol = symbol
+    resolution_note = ""
+    candles = []
+    snapshot_complete = False
+    snapshot_snipped = False
+
+    async with Session(provider_secret, refresh_token) as session:
+        try:
+            instrument = await Equity.get(session, symbol)
+            streamer_symbol = str(getattr(instrument, "streamer_symbol", "") or symbol).strip()
+        except Exception as exc:
+            resolution_note = f"Instrument lookup used the raw {symbol} symbol: {exc}"
+
+        async with DXLinkStreamer(session) as streamer:
+            await streamer.subscribe_candle(
+                [streamer_symbol],
+                "1m",
+                start_time=start_time,
+                extended_trading_hours=False,
+                refresh_interval=0.1,
+            )
+            deadline = time.monotonic() + 25.0
+
+            while len(candles) < 6000:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+
+                try:
+                    candle = await asyncio.wait_for(
+                        streamer.get_event(Candle),
+                        timeout=min(5.0, remaining),
+                    )
+                except TimeoutError:
+                    break
+
+                if not candle.remove:
+                    candles.append(candle)
+
+                if candle.snapshot_end or candle.snapshot_snip:
+                    snapshot_complete = True
+                    snapshot_snipped = bool(candle.snapshot_snip)
+                    break
+
+    if not snapshot_complete:
+        raise RuntimeError(
+            f"Tastytrade did not finish the {symbol} candle snapshot. Tap RUN LIVE TECHNICAL CHECK again."
+        )
+
+    return {
+        "candles": candles,
+        "streamer_symbol": streamer_symbol,
+        "snapshot_snipped": snapshot_snipped,
+        "resolution_note": resolution_note,
+    }
+
+
+def candle_events_to_dataframe(candle_payload):
+    rows = []
+
+    for candle in candle_payload.get("candles", []):
+        try:
+            timestamp_et = pd.to_datetime(int(candle.time), unit="ms", utc=True).tz_convert(EASTERN_ZONE)
+            open_price = float(candle.open)
+            high_price = float(candle.high)
+            low_price = float(candle.low)
+            close_price = float(candle.close)
+        except Exception:
+            continue
+
+        if min(open_price, high_price, low_price, close_price) <= 0:
+            continue
+
+        rows.append(
+            {
+                "timestamp_et": timestamp_et,
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": safe_float(getattr(candle, "volume", 0), 0.0),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["timestamp_et", "open", "high", "low", "close", "volume"])
+
+    frame = pd.DataFrame(rows).sort_values("timestamp_et")
+    frame = frame.drop_duplicates(subset=["timestamp_et"], keep="last").reset_index(drop=True)
+    clocks = frame["timestamp_et"].dt.time
+    frame = frame[(clocks >= clock_time(9, 30)) & (clocks < clock_time(16, 0))].copy()
+    frame["trade_date"] = frame["timestamp_et"].dt.date
+    return frame.reset_index(drop=True)
+
+
+def fetch_live_technical_analysis(symbol, review_label, now_et):
+    trade_date = now_et.date()
+    target_time = live_review_timestamp(trade_date, review_label)
+
+    if now_et.weekday() >= 5:
+        return {"error": "Today is not a regular weekday trading session."}
+
+    if now_et < target_time:
+        return {
+            "error": (
+                f"{review_label} is not ready yet. It will use only candles completed before "
+                f"{format_live_clock(target_time)}."
+            )
+        }
+
+    start_time = (now_et - timedelta(days=8)).replace(hour=9, minute=30, second=0, microsecond=0)
+
+    try:
+        candle_payload = asyncio.run(download_tastytrade_candle_events(symbol, start_time))
+    except Exception as exc:
+        return {"error": f"Live candle data unavailable for {symbol}: {exc}"}
+
+    all_1m = candle_events_to_dataframe(candle_payload)
+    if all_1m.empty:
+        return {"error": f"Tastytrade returned no usable regular-session candles for {symbol}."}
+
+    all_15m = build_live_15m_candles(all_1m)
+    day_1m = all_1m[all_1m["trade_date"] == trade_date].copy()
+    day_15m = all_15m[all_15m["trade_date"] == trade_date].copy()
+    if day_1m.empty or day_15m.empty:
+        return {"error": f"Tastytrade returned no regular-session candle set for {symbol} today."}
+
+    reviews = {}
+    review_order = list(LIVE_REVIEW_TIMES)
+    selected_index = review_order.index(review_label)
+
+    for label in review_order[: selected_index + 1]:
+        if now_et >= live_review_timestamp(trade_date, label):
+            reviews[label] = evaluate_live_technical_review(symbol, day_1m, day_15m, trade_date, label)
+
+    result = reviews.get(review_label)
+    if not result:
+        return {"error": f"The {review_label} review is not ready."}
+    if not result.get("ready"):
+        return {"error": result.get("message", "The technical review could not be completed.")}
+
+    return {
+        "symbol": symbol,
+        "review_label": review_label,
+        "trade_date": trade_date,
+        "result": result,
+        "reviews": reviews,
+        "day_15m": day_15m,
+        "last_candle_time": day_1m["timestamp_et"].max(),
+        "streamer_symbol": candle_payload.get("streamer_symbol", symbol),
+        "snapshot_snipped": candle_payload.get("snapshot_snipped", False),
+        "resolution_note": candle_payload.get("resolution_note", ""),
+    }
+
+
+def render_live_technical_status_box(decision):
+    if decision == "CLEAR TO ENTER":
+        background, border, foreground = "#DCFCE7", "#22C55E", "#166534"
+    elif decision.startswith("WAIT"):
+        background, border, foreground = "#FEF3C7", "#F59E0B", "#92400E"
+    else:
+        background, border, foreground = "#FEE2E2", "#EF4444", "#991B1B"
+
+    st.markdown(
+        f"""
+        <div style="background:{background};border:2px solid {border};color:{foreground};
+                    border-radius:14px;padding:18px 20px;text-align:center;font-size:1.65rem;
+                    font-weight:950;margin:10px 0 16px 0;">
+            {decision}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_live_technical_entry_check():
+    now_et = datetime.now(EASTERN_ZONE)
+    default_label = default_live_review_label(now_et)
+    review_labels = list(LIVE_REVIEW_TIMES)
+
+    st.title("Live Technical Entry Check")
+    st.caption(
+        "Step 2 — Tastytrade regular-session candles only. Uses the Research Engine's "
+        "Foundational rules and completed 15-minute candles; it never submits an order."
+    )
+    st.warning(
+        "Technical check only: a CLEAR result does not override the separate Step 1 headline-risk report."
+    )
+
+    control_col1, control_col2, control_col3 = st.columns([1.0, 1.15, 1.35])
+    with control_col1:
+        symbol = st.selectbox(
+            "Symbol",
+            LIVE_TECHNICAL_SYMBOLS,
+            key="live_technical_symbol",
+        )
+    with control_col2:
+        review_label = st.selectbox(
+            "Technical Checkpoint",
+            review_labels,
+            index=review_labels.index(default_label),
+            key="live_technical_review_label",
+        )
+    with control_col3:
+        run_clicked = st.button(
+            "RUN LIVE TECHNICAL CHECK",
+            key="run_live_technical_check",
+            type="primary",
+            width="stretch",
+        )
+
+    st.caption(
+        f"Current Eastern time: {now_et.strftime('%A, %B %d, %Y at ')}"
+        f"{format_live_clock(now_et, include_seconds=True)} | "
+        "After-hours prices are excluded."
+    )
+
+    request_key = (symbol, review_label, now_et.date().isoformat())
+    if run_clicked:
+        with st.spinner(f"Pulling {symbol} one-minute candles from Tastytrade and calculating ATR..."):
+            payload = fetch_live_technical_analysis(symbol, review_label, now_et)
+        st.session_state["live_technical_payload"] = payload
+        st.session_state["live_technical_request_key"] = request_key
+
+    payload = st.session_state.get("live_technical_payload")
+    cached_key = st.session_state.get("live_technical_request_key")
+
+    if not payload or cached_key != request_key:
+        st.info("Choose the symbol and checkpoint, then tap RUN LIVE TECHNICAL CHECK.")
+        return
+
+    if payload.get("error"):
+        st.error(payload["error"])
+        if symbol in {"XSP", "XND"}:
+            st.caption(
+                "Index candle availability depends on the Tastytrade/DXLink entitlement for this exact symbol. "
+                "The app will not substitute SPY, QQQ, NDX, or another instrument."
+            )
+        return
+
+    result = payload["result"]
+    render_live_technical_status_box(result["decision"])
+
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+    metric_col1.metric("9:30 Open", f"{result['market_open']:.2f}")
+    metric_col2.metric("Review Price", f"{result['review_price']:.2f}")
+    metric_col3.metric("Move From Open", f"{result['move_from_open']:.2f}")
+    metric_col4.metric("ATR(14), 15m", f"{result['atr']:.2f}")
+    metric_col5.metric("Largest 15m Body", f"{result['metrics']['max_body']:.2f}")
+
+    direction = "ABOVE" if result["signed_move"] > 0 else "BELOW" if result["signed_move"] < 0 else "AT"
+    st.write(
+        f"**Checkpoint:** {review_label} &nbsp; | &nbsp; "
+        f"**Price is {direction} the open by {abs(result['signed_move']):.2f}** &nbsp; | &nbsp; "
+        f"**Six-candle churn:** {result['metrics']['churn']:.2f}"
+    )
+
+    if result["flagged"]:
+        st.subheader("Why the review was flagged")
+    else:
+        st.subheader("Technical rule result")
+    for reason in result["reasons"]:
+        st.write(f"• {reason}")
+
+    rules = LIVE_FOUNDATIONAL_RULES[symbol]
+    distance_col1, distance_col2, distance_col3 = st.columns(3)
+    distance_col1.metric("Standard Distance", f"{rules['standard_distance']:g}")
+    distance_col2.metric("Preferred Distance", f"{rules['preferred_distance']:g}")
+    distance_col3.metric("Close Distance", f"{rules['closer_distance']:g}", help="Reference only; Close has additional symbol-specific and headline requirements.")
+    if symbol == "XND":
+        st.caption("XND's 5-point Close distance is research-only and is not an operating entry recommendation.")
+    else:
+        st.caption("Close distance is reference-only here; its additional headline and symbol-specific requirements still apply.")
+
+    target = live_review_timestamp(payload["trade_date"], review_label)
+    chart_bars = payload["day_15m"]
+    chart_bars = chart_bars[
+        (chart_bars["timestamp_et"] >= live_review_timestamp(payload["trade_date"], "11:00 AM").replace(hour=9, minute=30))
+        & (chart_bars["timestamp_et"] < target)
+    ].copy()
+    if not chart_bars.empty:
+        chart_frame = chart_bars.set_index("timestamp_et")[["close"]].rename(columns={"close": "15m Close"})
+        chart_frame["9:30 Open"] = result["market_open"]
+        st.subheader("Completed 15-Minute Candles Used")
+        st.line_chart(chart_frame, height=300)
+
+    review_rows = []
+    for label, review in payload["reviews"].items():
+        review_rows.append(
+            {
+                "CHECKPOINT": label,
+                "RESULT": review.get("decision") if review.get("ready") else review.get("message", "NOT READY"),
+                "ATR": round(review.get("atr"), 2) if review.get("ready") else None,
+                "MOVE FROM OPEN": round(review.get("move_from_open"), 2) if review.get("ready") else None,
+            }
+        )
+    if review_rows:
+        st.subheader("Today's Technical Checkpoints Through This Review")
+        st.dataframe(review_rows, width="stretch", hide_index=True)
+
+    with st.expander("Show the six 15-minute bars and calculation inputs"):
+        detail = result["recent_bars"].copy()
+        detail["Time ET"] = detail["timestamp_et"].dt.strftime("%I:%M %p").str.lstrip("0")
+        detail["Body"] = (detail["close"] - detail["open"]).abs()
+        detail = detail[["Time ET", "open", "high", "low", "close", "Body", "true_range", "atr_14"]]
+        detail.columns = ["TIME ET", "OPEN", "HIGH", "LOW", "CLOSE", "BODY", "TRUE RANGE", "ATR(14)"]
+        st.dataframe(detail, width="stretch", hide_index=True)
+
+    st.caption(
+        f"Tastytrade streamer symbol: {payload['streamer_symbol']} | "
+        f"Latest candle received: {format_live_clock(payload['last_candle_time'])} | "
+        "ATR uses Wilder smoothing: EWM alpha = 1/14."
+    )
+    if payload.get("snapshot_snipped"):
+        st.warning("Tastytrade marked the candle history snapshot as limited. The calculation used the returned history only.")
 
 
 # ==================================================
@@ -1054,7 +1698,7 @@ def render_options_opportunity_board():
             "REFRESH OPTIONS BOARD",
             key="options_board_refresh",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not selected_symbols:
@@ -1133,11 +1777,21 @@ def render_options_opportunity_board():
 
     st.dataframe(
         get_public_options_rows(visible_board_rows),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
     render_instant_credit_calculations(visible_board_rows, selected_symbols)
 
 
-render_options_opportunity_board()
+st.sidebar.markdown("### Live Trading Workflow")
+selected_live_page = st.sidebar.radio(
+    "Page",
+    ["Step 2 — Technical Entry Check", "Step 3 — Options Opportunity Board"],
+    key="live_app_page",
+)
+
+if selected_live_page == "Step 2 — Technical Entry Check":
+    render_live_technical_entry_check()
+else:
+    render_options_opportunity_board()
