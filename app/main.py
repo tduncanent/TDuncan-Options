@@ -1,9 +1,11 @@
 import asyncio
+import math
 import re
 import time
-from datetime import datetime, time as clock_time, timedelta
+from datetime import date, datetime, time as clock_time, timedelta
 from zoneinfo import ZoneInfo
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -144,6 +146,235 @@ LIVE_FOUNDATIONAL_RULES = {
     },
 }
 
+LIVE_DIRECTIONAL_DISTANCE_RULES = {
+    "XSP": {
+        "priority": 1,
+        "closer_distance": 8.5,
+        "preferred_distance": 11.5,
+        "closer_history": "1 post-skip closing failure in the five-year test",
+        "preferred_history": "0 post-skip closing failures in the five-year test",
+        "product_note": "Cash-settled index option; first symbol to review.",
+    },
+    "XND": {
+        "priority": 2,
+        "closer_distance": 3.0,
+        "preferred_distance": 5.0,
+        "closer_history": "2 post-skip closing failures in the five-year test",
+        "preferred_history": "0 post-skip closing failures in the five-year test",
+        "product_note": "Cash-settled index option; second symbol to review.",
+    },
+    "QQQ": {
+        "priority": 3,
+        "closer_distance": 10.0,
+        "preferred_distance": 12.5,
+        "extra_cushion_distance": 15.0,
+        "closer_history": "1 post-skip closing failure in the five-year test",
+        "preferred_history": "0 post-skip closing failures in the five-year test",
+        "extra_cushion_history": "0 post-skip closing failures in the five-year test",
+        "product_note": "ETF option; distance does not eliminate assignment or broker-liquidation risk.",
+    },
+    "SPY": {
+        "priority": 4,
+        "closer_distance": 10.0,
+        "preferred_distance": 12.5,
+        "extra_cushion_distance": 15.0,
+        "closer_history": "2 post-skip closing failures in the five-year test",
+        "preferred_history": "0 post-skip closing failures in the five-year test",
+        "extra_cushion_history": "0 post-skip closing failures in the five-year test",
+        "product_note": "ETF option; distance does not eliminate assignment or broker-liquidation risk.",
+    },
+}
+
+LIVE_NEXT_DAY_RULES = {
+    "QQQ": {
+        "preferred_fallback": 25.0,
+        "call": {
+            "extra_close": {
+                "distance": 9.0,
+                "conditions": [
+                    ("signed_move", "<=", -2.50, "QQQ is at least $2.50 below open"),
+                    ("morning_range", "<=", 6.00, "Morning range is no more than $6"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 14.0,
+                "conditions": [
+                    ("absolute_move", "<=", 3.00, "Absolute move from open is no more than $3"),
+                    ("atr", "<=", 1.25, "15-minute ATR is no more than $1.25"),
+                ],
+            },
+        },
+        "put": {
+            "extra_close": {
+                "distance": 10.0,
+                "conditions": [
+                    ("signed_move", ">=", 1.50, "QQQ is at least $1.50 above open"),
+                    ("atr", "<=", 1.25, "15-minute ATR is no more than $1.25"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 15.0,
+                "conditions": [
+                    ("signed_move", ">=", 1.00, "QQQ is at least $1 above open"),
+                    ("atr", "<=", 1.50, "15-minute ATR is no more than $1.50"),
+                ],
+            },
+        },
+    },
+    "SPY": {
+        "preferred_fallback": 15.0,
+        "call": {
+            "extra_close": {
+                "distance": 6.0,
+                "evidence": "121/121",
+                "conditions": [
+                    ("signed_move", "<=", -2.00, "SPY is at least $2 below open"),
+                    ("atr", "<=", 1.50, "15-minute ATR is no more than $1.50"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 13.0,
+                "evidence": "1,430/1,430",
+                "conditions": [
+                    ("absolute_move", "<=", 3.00, "Absolute move from open is no more than $3"),
+                    ("atr", "<=", 1.50, "15-minute ATR is no more than $1.50"),
+                ],
+            },
+        },
+        "put": {
+            "extra_close": {
+                "distance": 10.0,
+                "evidence": "568/568",
+                "conditions": [
+                    ("signed_move", ">=", -0.50, "SPY is no more than $0.50 below open"),
+                    ("morning_range", "<=", 2.00, "Morning range is no more than $2"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 11.0,
+                "evidence": "419/419",
+                "conditions": [
+                    ("signed_move", ">=", 0.50, "SPY is at least $0.50 above open"),
+                    ("morning_range", "<=", 3.00, "Morning range is no more than $3"),
+                ],
+            },
+        },
+    },
+    "XSP": {
+        "preferred_fallback": None,
+        "call": {
+            "extra_close": {
+                "distance": 6.0,
+                "evidence": "SPY source: 121/121",
+                "conditions": [
+                    ("signed_move", "<=", -2.00, "XSP is at least $2 below open"),
+                    ("atr", "<=", 1.50, "15-minute ATR is no more than $1.50"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 14.0,
+                "evidence": "799/799",
+                "conditions": [
+                    ("atr", "<=", 1.50, "15-minute ATR is no more than $1.50"),
+                    ("morning_range", "<=", 6.00, "Morning range is no more than $6"),
+                ],
+            },
+        },
+        "put": {
+            "extra_close": {
+                "distance": 10.0,
+                "evidence": "SPY source: 568/568",
+                "conditions": [
+                    ("signed_move", ">=", -0.50, "XSP is no more than $0.50 below open"),
+                    ("morning_range", "<=", 2.00, "Morning range is no more than $2"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 14.0,
+                "evidence": "551/551",
+                "conditions": [
+                    ("atr", "<=", 2.00, "15-minute ATR is no more than $2"),
+                    ("morning_range", "<=", 3.00, "Morning range is no more than $3"),
+                ],
+            },
+        },
+    },
+    "XND": {
+        "preferred_fallback": None,
+        "call": {
+            "extra_close": {
+                "distance": 5.0,
+                "conditions": [
+                    ("signed_move", "<=", -1.025, "XND is at least 1.025 points below open"),
+                    ("morning_range", "<=", 2.46, "Morning range is no more than 2.46 points"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 6.0,
+                "conditions": [
+                    ("absolute_move", "<=", 1.23, "Absolute move from open is no more than 1.23 points"),
+                    ("atr", "<=", 0.5125, "15-minute ATR is no more than 0.5125"),
+                ],
+            },
+        },
+        "put": {
+            "extra_close": {
+                "distance": 5.0,
+                "conditions": [
+                    ("signed_move", ">=", 0.615, "XND is at least 0.615 points above open"),
+                    ("atr", "<=", 0.5125, "15-minute ATR is no more than 0.5125"),
+                ],
+            },
+            "regular_closer": {
+                "distance": 7.0,
+                "conditions": [
+                    ("signed_move", ">=", 0.41, "XND is at least 0.41 points above open"),
+                    ("atr", "<=", 0.615, "15-minute ATR is no more than 0.615"),
+                ],
+            },
+        },
+    },
+}
+
+LIVE_FOUNDATIONAL_CLOSE_RULES = {
+    "QQQ": {"operating": True, "risk_envelope_multiplier": 2.50},
+    "SPY": {"operating": True, "maximum_1100_absolute_move": 4.0},
+    "XSP": {"operating": True, "allowed_reviews": ("1:00 PM", "2:15 PM")},
+    "XND": {"operating": False},
+}
+
+LIVE_HEADLINE_OPTIONS = (
+    "Not reviewed",
+    "Clear",
+    "Monitor — entry allowed",
+    "Wait — hold entry until next review",
+    "Suggest skip",
+)
+
+LIVE_CHART_INTERVALS = {
+    "1 Minute": "1min",
+    "5 Minute": "5min",
+    "15 Minute": "15min",
+}
+
+LIVE_FOMC_DATES = {
+    pd.Timestamp(value).date()
+    for value in [
+        "2018-05-02", "2018-06-13", "2018-08-01", "2018-09-26", "2018-11-08", "2018-12-19",
+        "2019-01-30", "2019-03-20", "2019-05-01", "2019-06-19", "2019-07-31", "2019-09-18",
+        "2019-10-30", "2019-12-11", "2020-01-29", "2020-03-03", "2020-04-29", "2020-06-10",
+        "2020-07-29", "2020-09-16", "2020-11-05", "2020-12-16", "2021-01-27", "2021-03-17",
+        "2021-04-28", "2021-06-16", "2021-07-28", "2021-09-22", "2021-11-03", "2021-12-15",
+        "2022-01-26", "2022-03-16", "2022-05-04", "2022-06-15", "2022-07-27", "2022-09-21",
+        "2022-11-02", "2022-12-14", "2023-02-01", "2023-03-22", "2023-05-03", "2023-06-14",
+        "2023-07-26", "2023-09-20", "2023-11-01", "2023-12-13", "2024-01-31", "2024-03-20",
+        "2024-05-01", "2024-06-12", "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+        "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17",
+        "2025-10-29", "2025-12-10", "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+        "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+    ]
+}
+
 
 def default_live_review_label(now_et):
     if now_et.time() >= LIVE_REVIEW_TIMES["2:15 PM"]:
@@ -165,6 +396,401 @@ def format_live_clock(value, include_seconds=False):
     hour = value.strftime("%I").lstrip("0") or "0"
     minute_second = value.strftime(":%M:%S" if include_seconds else ":%M")
     return f"{hour}{minute_second} {value.strftime('%p %Z')}".strip()
+
+
+def live_strike_text(value):
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):,.2f}".rstrip("0").rstrip(".")
+
+
+def live_outward_strike(boundary, side, increment=1.0):
+    scaled = float(boundary) / float(increment)
+    if str(side).upper() == "CALL":
+        strike = math.ceil(scaled - 1e-10) * increment
+    else:
+        strike = math.floor(scaled + 1e-10) * increment
+    return round(float(strike), 8)
+
+
+def live_strike_for_distance(market_open, distance, side):
+    boundary = market_open + distance if str(side).upper() == "CALL" else market_open - distance
+    return boundary, live_outward_strike(boundary, side)
+
+
+def build_live_headline_gate(trade_date, status, review_label, holding_window=False):
+    if trade_date in LIVE_FOMC_DATES:
+        return {
+            "clear": False,
+            "pending": False,
+            "waiting": False,
+            "status": "BLOCKED",
+            "reason": f"{trade_date} is an FOMC decision day.",
+        }
+    if status in {"Clear", "Monitor — entry allowed"}:
+        monitored = status == "Monitor — entry allowed"
+        return {
+            "clear": True,
+            "pending": False,
+            "waiting": False,
+            "status": "MONITOR" if monitored else "CLEAR",
+            "reason": (
+                "Headline conditions require monitoring, but entry remains allowed when the technical engine is clear."
+                if monitored
+                else "The separate headline review was marked clear."
+            ),
+        }
+    if status == "Wait — hold entry until next review":
+        if holding_window:
+            decision = "DO NOT OPEN 1DTE — HOLDING-WINDOW RISK UNRESOLVED"
+        elif review_label == "11:00 AM":
+            decision = "WAIT UNTIL 1:00 PM"
+        elif review_label == "1:00 PM":
+            decision = "WAIT UNTIL 2:15 PM"
+        else:
+            decision = "SKIP THE DAY — HEADLINE RISK STILL UNRESOLVED"
+        return {
+            "clear": False,
+            "pending": False,
+            "waiting": True,
+            "status": "WAIT",
+            "decision": decision,
+            "reason": "The headline-risk review remains unresolved.",
+        }
+    if status == "Suggest skip":
+        return {
+            "clear": False,
+            "pending": False,
+            "waiting": False,
+            "status": "BLOCKED",
+            "reason": "The separate headline review suggests skipping this opportunity.",
+        }
+    return {
+        "clear": False,
+        "pending": True,
+        "waiting": False,
+        "status": "REVIEW REQUIRED",
+        "reason": "The separate headline-risk report has not been entered on this page.",
+    }
+
+
+def get_live_next_trading_date(available_dates, trade_date):
+    later_dates = sorted({value for value in available_dates if value > trade_date})
+    if later_dates:
+        return later_dates[0]
+    try:
+        import pandas_market_calendars as market_calendars
+
+        calendar = market_calendars.get_calendar("NYSE")
+        schedule = calendar.schedule(
+            start_date=trade_date + timedelta(days=1),
+            end_date=trade_date + timedelta(days=14),
+        )
+        if not schedule.empty:
+            return schedule.index[0].date()
+    except Exception:
+        pass
+    candidate = trade_date + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def build_live_directional_opportunity(symbol, day_1m, today_gate, reviews, exact_eleven_ready=True):
+    rules = LIVE_DIRECTIONAL_DISTANCE_RULES[symbol]
+    base = {
+        "priority": rules["priority"],
+        "product_note": rules["product_note"],
+        "headline_gate": today_gate,
+        "candidates": [],
+    }
+    if day_1m.empty:
+        return {
+            **base,
+            "result": "UNAVAILABLE — NO SESSION DATA",
+            "reason": "No one-minute session data are available.",
+        }
+    if not exact_eleven_ready:
+        return {
+            **base,
+            "result": "UNAVAILABLE — 11:00 CANDLE STILL FORMING",
+            "reason": "Run again at 11:01 AM Eastern so the exact 11:00 one-minute close is final.",
+        }
+    day = day_1m.sort_values("timestamp_et")
+    market_open = float(day.iloc[0]["open"])
+    clocks = day["timestamp_et"].dt.time
+    exact_eleven = day[clocks == clock_time(11, 0)]
+    if exact_eleven.empty:
+        return {
+            **base,
+            "market_open": market_open,
+            "result": "UNAVAILABLE — EXACT 11:00 PRICE MISSING",
+            "reason": "This separate strategy requires the close of the exact 11:00 one-minute bar.",
+        }
+    review_price = float(exact_eleven.iloc[-1]["close"])
+    signed_move = review_price - market_open
+    eleven_review = reviews.get("11:00 AM", {})
+    if not eleven_review or not eleven_review.get("ready"):
+        foundational_context = "UNAVAILABLE"
+    elif eleven_review.get("flagged"):
+        foundational_context = "FLAGGED"
+    else:
+        foundational_context = "CLEAR"
+    base.update(
+        {
+            "market_open": market_open,
+            "review_price": review_price,
+            "signed_move": signed_move,
+            "absolute_move": abs(signed_move),
+            "foundational_context": foundational_context,
+        }
+    )
+    if math.isclose(signed_move, 0.0, abs_tol=1e-10):
+        return {
+            **base,
+            "direction": "NO DIRECTION",
+            "option_side": "NONE",
+            "result": "NO TRADE — 11:00 PRICE TIED THE OPEN",
+            "reason": "The exact 11:00 price did not establish a direction from the open.",
+        }
+    direction = "BULLISH" if signed_move > 0 else "BEARISH"
+    option_side = "PUT" if direction == "BULLISH" else "CALL"
+    candidate_specs = [
+        ("CLOSER", "Higher risk", rules["closer_distance"], rules["closer_history"]),
+        ("PREFERRED", "Preferred", rules["preferred_distance"], rules["preferred_history"]),
+    ]
+    if rules.get("extra_cushion_distance") is not None:
+        candidate_specs.append(
+            (
+                "EXTRA CUSHION",
+                "Further distance",
+                rules["extra_cushion_distance"],
+                rules["extra_cushion_history"],
+            )
+        )
+    candidates = []
+    for label, risk_level, distance, history_note in candidate_specs:
+        boundary, strike = live_strike_for_distance(market_open, float(distance), option_side)
+        candidates.append(
+            {
+                "label": label,
+                "risk_level": risk_level,
+                "distance_from_open": float(distance),
+                "boundary": boundary,
+                "short_strike": strike,
+                "distance_from_1100_price": abs(strike - review_price),
+                "history_note": history_note,
+            }
+        )
+    if today_gate["clear"]:
+        result = "ELIGIBLE — MONITOR" if today_gate["status"] == "MONITOR" else "ELIGIBLE"
+        reason = "The headline gate permits review. Use the chart, contract credit, and risk preference for the final selection."
+    elif today_gate.get("waiting"):
+        result = "WAIT — HEADLINE RISK UNRESOLVED"
+        reason = today_gate["reason"]
+    elif today_gate.get("pending"):
+        result = "NO TRADE — HEADLINE REVIEW REQUIRED"
+        reason = today_gate["reason"]
+    else:
+        result = "NO TRADE — MARKET-WIDE GATE BLOCKED"
+        reason = today_gate["reason"]
+    return {
+        **base,
+        "direction": direction,
+        "option_side": option_side,
+        "candidates": candidates,
+        "result": result,
+        "reason": reason,
+    }
+
+
+def build_live_morning_metrics(day_15m, review_result):
+    clocks = day_15m["timestamp_et"].dt.time
+    morning = day_15m[(clocks >= clock_time(9, 30)) & (clocks < clock_time(11, 0))]
+    market_open = float(review_result["market_open"])
+    review_price = float(review_result["review_price"])
+    signed_move = review_price - market_open
+    morning_range = float(morning["high"].max() - morning["low"].min()) if not morning.empty else float("nan")
+    return {
+        "market_open": market_open,
+        "review_price": review_price,
+        "signed_move": signed_move,
+        "absolute_move": abs(signed_move),
+        "morning_range": morning_range,
+        "atr": float(review_result["atr"]),
+    }
+
+
+def live_blocked_mode_status(foundational_result):
+    if str(foundational_result).startswith("WAIT"):
+        return "WAIT"
+    if str(foundational_result).startswith("SKIP"):
+        return "SKIP"
+    return "DO NOT ENTER"
+
+
+def evaluate_live_next_day_tier(tier, metrics):
+    conditions = []
+    for metric_name, operator, threshold, label in tier["conditions"]:
+        value = float(metrics.get(metric_name, float("nan")))
+        if operator == "<=":
+            passed = bool(not math.isnan(value) and value <= float(threshold))
+        else:
+            passed = bool(not math.isnan(value) and value >= float(threshold))
+        conditions.append(
+            {
+                "metric": metric_name,
+                "label": label,
+                "operator": operator,
+                "threshold": float(threshold),
+                "value": value,
+                "passed": passed,
+            }
+        )
+    return {
+        "distance": float(tier["distance"]),
+        "evidence": tier.get("evidence"),
+        "passed": all(condition["passed"] for condition in conditions),
+        "conditions": conditions,
+    }
+
+
+def build_live_foundational_assessment(symbol, review_label, current_result, reviews, today_gate):
+    technical_clear = bool(current_result.get("ready")) and not bool(current_result.get("flagged"))
+    if not technical_clear:
+        overall = current_result.get("decision", "DO NOT ENTER")
+        description = "The current Foundational technical review is flagged or unavailable."
+    elif today_gate["clear"]:
+        overall = "ENTER"
+        description = "Foundational technical conditions and today's entered headline gate are clear."
+    elif today_gate.get("waiting"):
+        overall = today_gate.get("decision", "WAIT")
+        description = today_gate["reason"]
+    elif today_gate.get("pending"):
+        overall = "DO NOT ENTER — HEADLINE REVIEW REQUIRED"
+        description = today_gate["reason"]
+    else:
+        overall = "SKIP — HEADLINE OR EVENT RISK"
+        description = today_gate["reason"]
+
+    rules = LIVE_FOUNDATIONAL_RULES[symbol]
+    modes = {}
+    for mode, key in (("Standard", "standard_distance"), ("Preferred", "preferred_distance")):
+        distance = float(rules[key])
+        _, call_strike = live_strike_for_distance(current_result["market_open"], distance, "CALL")
+        _, put_strike = live_strike_for_distance(current_result["market_open"], distance, "PUT")
+        modes[mode] = {
+            "status": "ENTER" if overall == "ENTER" else live_blocked_mode_status(overall),
+            "distance": distance,
+            "call_strike": call_strike,
+            "put_strike": put_strike,
+            "reason": description,
+        }
+
+    close_cfg = LIVE_FOUNDATIONAL_CLOSE_RULES[symbol]
+    close_distance = float(rules["closer_distance"])
+    _, close_call = live_strike_for_distance(current_result["market_open"], close_distance, "CALL")
+    _, close_put = live_strike_for_distance(current_result["market_open"], close_distance, "PUT")
+    eleven = reviews.get("11:00 AM", {})
+    eleven_clear = bool(eleven.get("ready")) and not bool(eleven.get("flagged"))
+    eleven_move = abs(float(eleven.get("review_price", 0)) - float(eleven.get("market_open", 0))) if eleven else float("nan")
+    containment_limit = close_cfg.get("maximum_1100_absolute_move")
+    envelope_multiplier = close_cfg.get("risk_envelope_multiplier")
+    eleven_atr = float(eleven["atr"]) if eleven and eleven.get("atr") is not None else float("nan")
+    risk_envelope = (
+        eleven_move + float(envelope_multiplier) * eleven_atr
+        if envelope_multiplier is not None and not math.isnan(eleven_atr)
+        else None
+    )
+    if not close_cfg["operating"]:
+        close_status = "RESEARCH ONLY — DO NOT ENTER"
+        close_reason = "This symbol's Close distance is not an operating entry recommendation."
+    elif close_cfg.get("allowed_reviews") and review_label not in close_cfg["allowed_reviews"]:
+        close_status = "DO NOT ENTER"
+        close_reason = f"Close is available only at {' or '.join(close_cfg['allowed_reviews'])} for {symbol}."
+    elif overall != "ENTER":
+        close_status = live_blocked_mode_status(overall)
+        close_reason = description
+    elif not eleven_clear:
+        close_status = "DO NOT ENTER"
+        close_reason = "Close is disabled because the 11:00 review was flagged or unavailable."
+    elif containment_limit is not None and eleven_move >= float(containment_limit):
+        close_status = "DO NOT ENTER"
+        close_reason = f"The 11:00 move was {eleven_move:.2f}; it must be under {float(containment_limit):g}."
+    elif envelope_multiplier is not None and (risk_envelope is None or risk_envelope >= close_distance):
+        close_status = "DO NOT ENTER"
+        close_reason = f"The 11:00 projected risk envelope was {risk_envelope:.2f}; it must be below {close_distance:.2f}."
+    else:
+        close_status = "ENTER"
+        close_reason = "The symbol-specific Close requirements passed."
+    modes["Close"] = {
+        "status": close_status,
+        "distance": close_distance,
+        "call_strike": close_call,
+        "put_strike": close_put,
+        "reason": close_reason,
+    }
+    return {
+        "result": overall,
+        "description": description,
+        "technical_clear": technical_clear,
+        "modes": modes,
+    }
+
+
+def build_live_next_day_assessment(symbol, foundational, metrics, today_gate, next_gate):
+    rules = LIVE_NEXT_DAY_RULES[symbol]
+    sides = {}
+    for side in ("call", "put"):
+        side_rules = rules[side]
+        extra = evaluate_live_next_day_tier(side_rules["extra_close"], metrics)
+        regular = evaluate_live_next_day_tier(side_rules["regular_closer"], metrics)
+        selected = None
+        selected_name = None
+        if extra["passed"]:
+            selected, selected_name = extra, "Extra-Close"
+        elif regular["passed"]:
+            selected, selected_name = regular, "Regular Closer"
+        elif rules.get("preferred_fallback") is not None:
+            selected = {
+                "distance": float(rules["preferred_fallback"]),
+                "evidence": rules.get("preferred_fallback_evidence"),
+                "passed": True,
+                "conditions": [],
+            }
+            selected_name = "Preferred Fallback"
+        if selected is None:
+            strike = None
+            result = "DO NOT ENTER"
+            reason = "Neither approved closer tier qualified, and no separate Preferred 1DTE fallback is approved."
+        else:
+            _, strike = live_strike_for_distance(metrics["market_open"], selected["distance"], side)
+            if not foundational["technical_clear"]:
+                blocker = "FOUNDATIONAL FILTER"
+            elif not today_gate["clear"]:
+                blocker = "TODAY'S HEADLINE GATE"
+            elif not next_gate["clear"]:
+                blocker = "NEXT-TRADING-DAY RISK GATE"
+            else:
+                blocker = None
+            if blocker:
+                result = f"TOOL CONDITIONS PASSED — ENTRY BLOCKED BY {blocker}"
+                reason = f"The {selected_name} conditions passed, but the {blocker.lower()} is not clear."
+            else:
+                result = "ENTER"
+                reason = f"The {selected_name} conditions and both headline gates are clear."
+        sides[side] = {
+            "side": side.title(),
+            "result": result,
+            "selected_tier": selected_name,
+            "selected_evidence": selected.get("evidence") if selected else None,
+            "distance": selected["distance"] if selected else None,
+            "strike": strike,
+            "reason": reason,
+            "tier_evaluations": {"Extra-Close": extra, "Regular Closer": regular},
+        }
+    overall = "ENTER — ONE OR MORE SIDES QUALIFY" if any(item["result"] == "ENTER" for item in sides.values()) else "DO NOT ENTER"
+    return {"result": overall, "sides": sides}
 
 
 def live_near_extreme(price, low, high, percent):
@@ -406,9 +1032,9 @@ async def download_tastytrade_candle_events(symbol, start_time):
                 extended_trading_hours=False,
                 refresh_interval=0.1,
             )
-            deadline = time.monotonic() + 25.0
+            deadline = time.monotonic() + 55.0
 
-            while len(candles) < 6000:
+            while len(candles) < 60000:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -429,15 +1055,17 @@ async def download_tastytrade_candle_events(symbol, start_time):
                     snapshot_snipped = bool(candle.snapshot_snip)
                     break
 
-    if not snapshot_complete:
+    if not snapshot_complete and not candles:
         raise RuntimeError(
-            f"Tastytrade did not finish the {symbol} candle snapshot. Tap RUN LIVE TECHNICAL CHECK again."
+            f"Tastytrade did not finish the {symbol} candle snapshot within the live-app limit. "
+            "Choose a more recent date or tap RUN LIVE TECHNICAL CHECK again."
         )
 
     return {
         "candles": candles,
         "streamer_symbol": streamer_symbol,
         "snapshot_snipped": snapshot_snipped,
+        "snapshot_incomplete": not snapshot_complete,
         "resolution_note": resolution_note,
     }
 
@@ -480,14 +1108,19 @@ def candle_events_to_dataframe(candle_payload):
     return frame.reset_index(drop=True)
 
 
-def fetch_live_technical_analysis(symbol, review_label, now_et):
-    trade_date = now_et.date()
+def fetch_live_technical_analysis(
+    symbol,
+    review_label,
+    trade_date,
+    now_et,
+    today_headline_status,
+    next_headline_status,
+):
     target_time = live_review_timestamp(trade_date, review_label)
 
-    if now_et.weekday() >= 5:
-        return {"error": "Today is not a regular weekday trading session."}
-
-    if now_et < target_time:
+    if trade_date > now_et.date():
+        return {"error": "A future trading date cannot be analyzed."}
+    if trade_date == now_et.date() and now_et < target_time:
         return {
             "error": (
                 f"{review_label} is not ready yet. It will use only candles completed before "
@@ -495,29 +1128,38 @@ def fetch_live_technical_analysis(symbol, review_label, now_et):
             )
         }
 
-    start_time = (now_et - timedelta(days=8)).replace(hour=9, minute=30, second=0, microsecond=0)
+    warmup_date = trade_date - timedelta(days=8)
+    start_time = datetime.combine(warmup_date, clock_time(9, 30), tzinfo=EASTERN_ZONE)
 
     try:
         candle_payload = asyncio.run(download_tastytrade_candle_events(symbol, start_time))
     except Exception as exc:
-        return {"error": f"Live candle data unavailable for {symbol}: {exc}"}
+        return {"error": f"Live/historical candle data unavailable for {symbol}: {exc}"}
 
     all_1m = candle_events_to_dataframe(candle_payload)
     if all_1m.empty:
         return {"error": f"Tastytrade returned no usable regular-session candles for {symbol}."}
 
+    available_dates = sorted(all_1m["trade_date"].unique())
     all_15m = build_live_15m_candles(all_1m)
     day_1m = all_1m[all_1m["trade_date"] == trade_date].copy()
     day_15m = all_15m[all_15m["trade_date"] == trade_date].copy()
     if day_1m.empty or day_15m.empty:
-        return {"error": f"Tastytrade returned no regular-session candle set for {symbol} today."}
+        first_date = available_dates[0] if available_dates else "none"
+        last_date = available_dates[-1] if available_dates else "none"
+        return {
+            "error": (
+                f"NO DATA for {symbol} on {trade_date}. The returned Tastytrade candle set covered "
+                f"{first_date} through {last_date}. Choose another trading day."
+            )
+        }
 
     reviews = {}
     review_order = list(LIVE_REVIEW_TIMES)
     selected_index = review_order.index(review_label)
-
     for label in review_order[: selected_index + 1]:
-        if now_et >= live_review_timestamp(trade_date, label):
+        label_time = live_review_timestamp(trade_date, label)
+        if trade_date < now_et.date() or now_et >= label_time:
             reviews[label] = evaluate_live_technical_review(symbol, day_1m, day_15m, trade_date, label)
 
     result = reviews.get(review_label)
@@ -526,18 +1168,243 @@ def fetch_live_technical_analysis(symbol, review_label, now_et):
     if not result.get("ready"):
         return {"error": result.get("message", "The technical review could not be completed.")}
 
+    next_trading_date = get_live_next_trading_date(available_dates, trade_date)
+    today_gate = build_live_headline_gate(
+        trade_date,
+        today_headline_status,
+        review_label,
+        holding_window=False,
+    )
+    next_gate = build_live_headline_gate(
+        next_trading_date,
+        next_headline_status,
+        review_label,
+        holding_window=True,
+    )
+    foundational = build_live_foundational_assessment(
+        symbol,
+        review_label,
+        result,
+        reviews,
+        today_gate,
+    )
+    metrics = build_live_morning_metrics(day_15m, result)
+    next_day = build_live_next_day_assessment(
+        symbol,
+        foundational,
+        metrics,
+        today_gate,
+        next_gate,
+    )
+    directional = build_live_directional_opportunity(
+        symbol,
+        day_1m,
+        today_gate,
+        reviews,
+        exact_eleven_ready=(
+            trade_date < now_et.date()
+            or now_et >= datetime.combine(trade_date, clock_time(11, 1), tzinfo=EASTERN_ZONE)
+        ),
+    )
+
     return {
         "symbol": symbol,
         "review_label": review_label,
         "trade_date": trade_date,
+        "next_trading_date": next_trading_date,
         "result": result,
         "reviews": reviews,
+        "foundational": foundational,
+        "directional": directional,
+        "next_day": next_day,
+        "today_gate": today_gate,
+        "next_gate": next_gate,
+        "metrics": metrics,
+        "day_1m": day_1m,
         "day_15m": day_15m,
         "last_candle_time": day_1m["timestamp_et"].max(),
+        "available_first_date": available_dates[0],
+        "available_last_date": available_dates[-1],
         "streamer_symbol": candle_payload.get("streamer_symbol", symbol),
         "snapshot_snipped": candle_payload.get("snapshot_snipped", False),
+        "snapshot_incomplete": candle_payload.get("snapshot_incomplete", False),
         "resolution_note": candle_payload.get("resolution_note", ""),
     }
+
+
+def resample_live_chart_candles(day_1m, interval, cutoff):
+    visible = day_1m[day_1m["timestamp_et"] < cutoff].copy()
+    if interval == "1min" or visible.empty:
+        return visible[["timestamp_et", "open", "high", "low", "close", "volume"]].copy()
+    candles = visible.set_index("timestamp_et").resample(
+        interval,
+        origin="start_day",
+        offset="30min",
+        label="left",
+        closed="left",
+    ).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    return candles.dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+
+def build_live_candlestick_chart(candles, symbol, trade_date, market_open, interval_label):
+    frame = candles.copy()
+    frame["Direction"] = frame["close"].ge(frame["open"]).map({True: "Up", False: "Down"})
+    tooltip = [
+        alt.Tooltip("timestamp_et:T", title="Time ET", format="%I:%M %p"),
+        alt.Tooltip("open:Q", title="Open", format=",.2f"),
+        alt.Tooltip("high:Q", title="High", format=",.2f"),
+        alt.Tooltip("low:Q", title="Low", format=",.2f"),
+        alt.Tooltip("close:Q", title="Close", format=",.2f"),
+    ]
+    x_axis = alt.X(
+        "timestamp_et:T",
+        title="Eastern Time",
+        axis=alt.Axis(format="%I:%M %p", labelAngle=-45, tickCount=10),
+    )
+    price_scale = alt.Scale(zero=False, padding=12)
+    base = alt.Chart(frame).encode(x=x_axis, tooltip=tooltip)
+    wick = base.mark_rule().encode(
+        y=alt.Y("low:Q", title="Price", scale=price_scale),
+        y2="high:Q",
+        color=alt.Color(
+            "Direction:N",
+            scale=alt.Scale(domain=["Up", "Down"], range=["#16A34A", "#DC2626"]),
+            legend=None,
+        ),
+    )
+    body_size = 3 if interval_label == "1 Minute" else 8 if interval_label == "5 Minute" else 14
+    bodies = base.mark_bar(size=body_size).encode(
+        y=alt.Y("open:Q", scale=price_scale),
+        y2="close:Q",
+        color=alt.Color(
+            "Direction:N",
+            scale=alt.Scale(domain=["Up", "Down"], range=["#16A34A", "#DC2626"]),
+            legend=None,
+        ),
+    )
+    open_line_data = pd.DataFrame({"open_reference": [float(market_open)]})
+    open_line = alt.Chart(open_line_data).mark_rule(
+        color="#2563EB",
+        strokeDash=[7, 5],
+        size=2,
+    ).encode(y=alt.Y("open_reference:Q", scale=price_scale))
+    return (wick + bodies + open_line).properties(
+        height=470,
+        title=f"{symbol} — {trade_date} — {interval_label}",
+    ).interactive(bind_y=False)
+
+
+def show_live_tool_status(message):
+    if str(message).startswith(("ENTER", "CLEAR", "ELIGIBLE")):
+        st.success(message)
+    elif str(message).startswith(("WAIT", "REVIEW", "UNAVAILABLE")):
+        st.warning(message)
+    else:
+        st.error(message)
+
+
+def render_live_directional_section(opportunity):
+    st.subheader("Directional Distance Opportunity — Separate Strategy")
+    st.caption(
+        "Uses the fixed 9:30 opening price and the exact 11:00 one-minute close. "
+        "This is displayed beside the Golden filters but is not blended into them."
+    )
+    show_live_tool_status(opportunity["result"])
+    st.caption(opportunity["reason"])
+    if opportunity.get("review_price") is not None:
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Daily Priority", f"{opportunity['priority']} of 4")
+        d2.metric("9:30 Open", f"{opportunity['market_open']:.2f}")
+        d3.metric("Exact 11:00 Price", f"{opportunity['review_price']:.2f}")
+        d4.metric("Signed Move", f"{opportunity['signed_move']:+.2f}")
+        d5.metric("Direction / Side", f"{opportunity['direction']} → {opportunity['option_side']}")
+    if opportunity.get("candidates"):
+        rows = [
+            {
+                "CHOICE": item["label"],
+                "RISK LEVEL": item["risk_level"],
+                "DISTANCE FROM 9:30 OPEN": live_strike_text(item["distance_from_open"]),
+                "SHORT STRIKE": live_strike_text(item["short_strike"]),
+                "DISTANCE FROM 11:00 PRICE": live_strike_text(item["distance_from_1100_price"]),
+                "FIVE-YEAR CLOSING TEST AFTER KNOWN SKIPS": item["history_note"],
+            }
+            for item in opportunity["candidates"]
+        ]
+        st.dataframe(rows, width="stretch", hide_index=True)
+    context_col, gate_col = st.columns(2)
+    context_col.metric("11:00 Foundational Context", opportunity.get("foundational_context", "UNAVAILABLE"))
+    context_col.caption("Context only; it does not gate this separate strategy.")
+    gate = opportunity["headline_gate"]
+    gate_col.metric("Market-Wide Headline Gate", gate["status"])
+    gate_col.caption(gate["reason"])
+    st.caption(opportunity["product_note"])
+
+
+def render_live_foundational_section(foundational):
+    st.subheader("1. Foundational Golden Filter")
+    show_live_tool_status(foundational["result"])
+    st.caption(foundational["description"])
+    rows = []
+    for mode in ("Standard", "Preferred", "Close"):
+        item = foundational["modes"][mode]
+        rows.append(
+            {
+                "MODE": mode,
+                "RESULT": item["status"],
+                "DISTANCE": live_strike_text(item["distance"]),
+                "CALL SHORT STRIKE": live_strike_text(item["call_strike"]),
+                "PUT SHORT STRIKE": live_strike_text(item["put_strike"]),
+                "DESCRIPTION": item["reason"],
+            }
+        )
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def render_live_next_day_section(next_day, trade_date, next_trading_date):
+    st.subheader("2. Next Day Expiration Golden Filter — 1DTE")
+    show_live_tool_status(next_day["result"])
+    st.caption(
+        f"Entry date: {trade_date} | Next trading-day expiration: {next_trading_date}. "
+        "Extra-Close is tested first, then Regular Closer and any approved Preferred fallback."
+    )
+    rows = []
+    for side_key in ("call", "put"):
+        item = next_day["sides"][side_key]
+        rows.append(
+            {
+                "SIDE": item["side"],
+                "RESULT": item["result"],
+                "SELECTED TIER": item["selected_tier"] or "None",
+                "EVIDENCE": item.get("selected_evidence") or "—",
+                "DISTANCE": live_strike_text(item["distance"]),
+                "SHORT STRIKE": live_strike_text(item["strike"]),
+                "DESCRIPTION": item["reason"],
+            }
+        )
+    st.dataframe(rows, width="stretch", hide_index=True)
+    with st.expander("Show 1DTE tier condition details"):
+        for side_key in ("call", "put"):
+            item = next_day["sides"][side_key]
+            st.markdown(f"**{item['side']}**")
+            detail_rows = []
+            for tier_name, tier in item["tier_evaluations"].items():
+                for condition in tier["conditions"]:
+                    detail_rows.append(
+                        {
+                            "TIER": tier_name,
+                            "CONDITION": condition["label"],
+                            "ACTUAL": live_strike_text(condition["value"]),
+                            "PASSED": condition["passed"],
+                            "EVIDENCE": tier.get("evidence") or "—",
+                        }
+                    )
+            st.dataframe(detail_rows, width="stretch", hide_index=True)
 
 
 def render_live_technical_status_box(decision):
@@ -567,31 +1434,59 @@ def render_live_technical_entry_check():
 
     st.title("Live Technical Entry Check")
     st.caption(
-        "Step 2 — Tastytrade regular-session candles only. Uses the Research Engine's "
-        "Foundational rules and completed 15-minute candles; it never submits an order."
+        "Step 2 — Tastytrade regular-session candles only. Mirrors the Research Engine's "
+        "Directional Distance, Foundational, and Next Day Expiration assessments; it never submits an order."
     )
     st.warning(
         "Technical check only: a CLEAR result does not override the separate Step 1 headline-risk report."
     )
 
-    control_col1, control_col2, control_col3 = st.columns([1.0, 1.15, 1.35])
-    with control_col1:
-        symbol = st.selectbox(
-            "Symbol",
-            LIVE_TECHNICAL_SYMBOLS,
-            key="live_technical_symbol",
-        )
-    with control_col2:
-        review_label = st.selectbox(
-            "Technical Checkpoint",
-            review_labels,
-            index=review_labels.index(default_label),
-            key="live_technical_review_label",
-        )
-    with control_col3:
-        run_clicked = st.button(
-            "RUN LIVE TECHNICAL CHECK",
-            key="run_live_technical_check",
+    with st.form("live_technical_assessment_form", clear_on_submit=False):
+        control_col1, control_col2, control_col3, control_col4 = st.columns(4)
+        with control_col1:
+            symbol = st.selectbox("Symbol", LIVE_TECHNICAL_SYMBOLS, key="live_technical_symbol")
+        with control_col2:
+            selected_date = st.date_input(
+                "Trading Date",
+                value=now_et.date(),
+                min_value=date(2001, 9, 9),
+                max_value=now_et.date(),
+                key="live_technical_date",
+                help="Choose any past date. The app will report NO DATA if Tastytrade cannot return it.",
+            )
+        with control_col3:
+            review_label = st.selectbox(
+                "Technical Checkpoint",
+                review_labels,
+                index=review_labels.index(default_label),
+                key="live_technical_review_label",
+            )
+        with control_col4:
+            chart_interval_label = st.selectbox(
+                "Chart Timeframe",
+                list(LIVE_CHART_INTERVALS),
+                index=2,
+                key="live_technical_chart_interval",
+            )
+
+        st.markdown("**Step 1 Headline Results — enter the conclusions from your separate phone report**")
+        gate_col1, gate_col2 = st.columns(2)
+        with gate_col1:
+            today_headline_status = st.selectbox(
+                "Selected trading day / 0DTE",
+                LIVE_HEADLINE_OPTIONS,
+                key="live_today_headline_status",
+                help="Monitor allows entry when the technical engine is clear. Wait delays entry; Suggest skip blocks it.",
+            )
+        with gate_col2:
+            next_headline_status = st.selectbox(
+                "Next trading day / 1DTE holding window",
+                LIVE_HEADLINE_OPTIONS,
+                key="live_next_headline_status",
+                help="The 1DTE tool requires both today's and the next trading day's headline gates to permit entry.",
+            )
+        run_clicked = st.form_submit_button(
+            "RUN COMPLETE TECHNICAL ASSESSMENT",
             type="primary",
             width="stretch",
         )
@@ -599,13 +1494,29 @@ def render_live_technical_entry_check():
     st.caption(
         f"Current Eastern time: {now_et.strftime('%A, %B %d, %Y at ')}"
         f"{format_live_clock(now_et, include_seconds=True)} | "
-        "After-hours prices are excluded."
+        "After-hours prices are excluded. The date picker has no short artificial lookback; returned history depends on Tastytrade."
     )
 
-    request_key = (symbol, review_label, now_et.date().isoformat())
+    request_key = (
+        symbol,
+        selected_date.isoformat(),
+        review_label,
+        chart_interval_label,
+        today_headline_status,
+        next_headline_status,
+    )
     if run_clicked:
-        with st.spinner(f"Pulling {symbol} one-minute candles from Tastytrade and calculating ATR..."):
-            payload = fetch_live_technical_analysis(symbol, review_label, now_et)
+        with st.spinner(
+            f"Pulling {symbol} one-minute candles for {selected_date} and running all technical tools..."
+        ):
+            payload = fetch_live_technical_analysis(
+                symbol,
+                review_label,
+                selected_date,
+                now_et,
+                today_headline_status,
+                next_headline_status,
+            )
         st.session_state["live_technical_payload"] = payload
         st.session_state["live_technical_request_key"] = request_key
 
@@ -613,7 +1524,7 @@ def render_live_technical_entry_check():
     cached_key = st.session_state.get("live_technical_request_key")
 
     if not payload or cached_key != request_key:
-        st.info("Choose the symbol and checkpoint, then tap RUN LIVE TECHNICAL CHECK.")
+        st.info("Choose the symbol, date, checkpoint, and headline results, then run the complete assessment.")
         return
 
     if payload.get("error"):
@@ -626,20 +1537,24 @@ def render_live_technical_entry_check():
         return
 
     result = payload["result"]
+    st.caption(
+        f"Showing completed assessment: {symbol} · {selected_date} · {review_label} · {chart_interval_label} | "
+        f"Candle response coverage: {payload['available_first_date']} through {payload['available_last_date']}"
+    )
     render_live_technical_status_box(result["decision"])
 
-    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5, metric_col6 = st.columns(6)
     metric_col1.metric("9:30 Open", f"{result['market_open']:.2f}")
     metric_col2.metric("Review Price", f"{result['review_price']:.2f}")
     metric_col3.metric("Move From Open", f"{result['move_from_open']:.2f}")
     metric_col4.metric("ATR(14), 15m", f"{result['atr']:.2f}")
     metric_col5.metric("Largest 15m Body", f"{result['metrics']['max_body']:.2f}")
+    metric_col6.metric("Six-Candle Churn", f"{result['metrics']['churn']:.2f}")
 
     direction = "ABOVE" if result["signed_move"] > 0 else "BELOW" if result["signed_move"] < 0 else "AT"
     st.write(
         f"**Checkpoint:** {review_label} &nbsp; | &nbsp; "
-        f"**Price is {direction} the open by {abs(result['signed_move']):.2f}** &nbsp; | &nbsp; "
-        f"**Six-candle churn:** {result['metrics']['churn']:.2f}"
+        f"**Price is {direction} the open by {abs(result['signed_move']):.2f}**"
     )
 
     if result["flagged"]:
@@ -649,27 +1564,40 @@ def render_live_technical_entry_check():
     for reason in result["reasons"]:
         st.write(f"• {reason}")
 
-    rules = LIVE_FOUNDATIONAL_RULES[symbol]
-    distance_col1, distance_col2, distance_col3 = st.columns(3)
-    distance_col1.metric("Standard Distance", f"{rules['standard_distance']:g}")
-    distance_col2.metric("Preferred Distance", f"{rules['preferred_distance']:g}")
-    distance_col3.metric("Close Distance", f"{rules['closer_distance']:g}", help="Reference only; Close has additional symbol-specific and headline requirements.")
-    if symbol == "XND":
-        st.caption("XND's 5-point Close distance is research-only and is not an operating entry recommendation.")
-    else:
-        st.caption("Close distance is reference-only here; its additional headline and symbol-specific requirements still apply.")
+    st.subheader("Headline Gate Summary")
+    today_gate_col, next_gate_col = st.columns(2)
+    today_gate_col.metric("Selected Day / 0DTE", payload["today_gate"]["status"])
+    today_gate_col.caption(payload["today_gate"]["reason"])
+    next_gate_col.metric("Next Trading Day / 1DTE", payload["next_gate"]["status"])
+    next_gate_col.caption(payload["next_gate"]["reason"])
+
+    render_live_directional_section(payload["directional"])
+    render_live_foundational_section(payload["foundational"])
+    render_live_next_day_section(
+        payload["next_day"],
+        payload["trade_date"],
+        payload["next_trading_date"],
+    )
 
     target = live_review_timestamp(payload["trade_date"], review_label)
-    chart_bars = payload["day_15m"]
-    chart_bars = chart_bars[
-        (chart_bars["timestamp_et"] >= live_review_timestamp(payload["trade_date"], "11:00 AM").replace(hour=9, minute=30))
-        & (chart_bars["timestamp_et"] < target)
-    ].copy()
-    if not chart_bars.empty:
-        chart_frame = chart_bars.set_index("timestamp_et")[["close"]].rename(columns={"close": "15m Close"})
-        chart_frame["9:30 Open"] = result["market_open"]
-        st.subheader("Completed 15-Minute Candles Used")
-        st.line_chart(chart_frame, height=300)
+    chart_candles = resample_live_chart_candles(
+        payload["day_1m"],
+        LIVE_CHART_INTERVALS[chart_interval_label],
+        target,
+    )
+    if not chart_candles.empty:
+        st.subheader("Price Chart Through the Selected Checkpoint")
+        st.caption("Green/red candles use the actual session price range. The dashed blue line is the fixed 9:30 opening price.")
+        st.altair_chart(
+            build_live_candlestick_chart(
+                chart_candles,
+                symbol,
+                selected_date,
+                result["market_open"],
+                chart_interval_label,
+            ),
+            width="stretch",
+        )
 
     review_rows = []
     for label, review in payload["reviews"].items():
@@ -682,7 +1610,7 @@ def render_live_technical_entry_check():
             }
         )
     if review_rows:
-        st.subheader("Today's Technical Checkpoints Through This Review")
+        st.subheader("Technical Checkpoints Through the Selected Review")
         st.dataframe(review_rows, width="stretch", hide_index=True)
 
     with st.expander("Show the six 15-minute bars and calculation inputs"):
@@ -695,11 +1623,16 @@ def render_live_technical_entry_check():
 
     st.caption(
         f"Tastytrade streamer symbol: {payload['streamer_symbol']} | "
-        f"Latest candle received: {format_live_clock(payload['last_candle_time'])} | "
+        f"Last candle on selected date: {format_live_clock(payload['last_candle_time'])} | "
         "ATR uses Wilder smoothing: EWM alpha = 1/14."
     )
     if payload.get("snapshot_snipped"):
         st.warning("Tastytrade marked the candle history snapshot as limited. The calculation used the returned history only.")
+    if payload.get("snapshot_incomplete"):
+        st.warning(
+            "The historical snapshot reached the live-app time limit. The selected session and ATR warm-up "
+            "were complete enough to calculate, but the displayed response-coverage dates are not the API's full archive."
+        )
 
 
 # ==================================================
