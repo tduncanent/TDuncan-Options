@@ -10,6 +10,15 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from market_movement import (
+    MOVEMENT_REVIEW_CLOCKS,
+    MOVEMENT_REVIEW_OPTIONS,
+    TARGET_FRESH,
+    TARGET_LABELS,
+    TARGET_OPEN,
+    build_market_movement_assessment,
+)
+
 
 st.set_page_config(page_title="TDuncan & Co", layout="wide")
 
@@ -74,6 +83,7 @@ LIVE_REVIEW_TIMES = {
     "1:00 PM": clock_time(13, 0),
     "2:15 PM": clock_time(14, 15),
 }
+LIVE_ANALYSIS_TIMES = dict(MOVEMENT_REVIEW_CLOCKS)
 
 # This is the Foundational Golden Filter subset used by the Research Engine.
 # Keeping it here makes the live page deployable as a single Streamlit file.
@@ -148,23 +158,20 @@ LIVE_FOUNDATIONAL_RULES = {
 
 LIVE_DIRECTIONAL_DISTANCE_RULES = {
     "XSP": {
-        "priority": 1,
         "closer_distance": 8.5,
         "preferred_distance": 11.5,
         "closer_history": "1 post-skip closing failure in the five-year test",
         "preferred_history": "0 post-skip closing failures in the five-year test",
-        "product_note": "Cash-settled index option; first symbol to review.",
+        "product_note": "Cash-settled index option.",
     },
     "XND": {
-        "priority": 2,
         "closer_distance": 3.0,
         "preferred_distance": 5.0,
         "closer_history": "2 post-skip closing failures in the five-year test",
         "preferred_history": "0 post-skip closing failures in the five-year test",
-        "product_note": "Cash-settled index option; second symbol to review.",
+        "product_note": "Cash-settled index option.",
     },
     "QQQ": {
-        "priority": 3,
         "closer_distance": 10.0,
         "preferred_distance": 12.5,
         "extra_cushion_distance": 15.0,
@@ -174,7 +181,6 @@ LIVE_DIRECTIONAL_DISTANCE_RULES = {
         "product_note": "ETF option; distance does not eliminate assignment or broker-liquidation risk.",
     },
     "SPY": {
-        "priority": 4,
         "closer_distance": 10.0,
         "preferred_distance": 12.5,
         "extra_cushion_distance": 15.0,
@@ -377,11 +383,25 @@ LIVE_FOMC_DATES = {
 
 
 def default_live_review_label(now_et):
-    if now_et.time() >= LIVE_REVIEW_TIMES["2:15 PM"]:
-        return "2:15 PM"
-    if now_et.time() >= LIVE_REVIEW_TIMES["1:00 PM"]:
-        return "1:00 PM"
-    return "11:00 AM"
+    return "9:40 AM"
+
+
+def live_analysis_timestamp(trade_date, review_label):
+    return datetime.combine(
+        trade_date,
+        LIVE_ANALYSIS_TIMES[review_label],
+        tzinfo=EASTERN_ZONE,
+    )
+
+
+def applicable_live_golden_review(review_label):
+    review_clock = LIVE_ANALYSIS_TIMES[review_label]
+    applicable = [
+        label
+        for label, checkpoint_clock in LIVE_REVIEW_TIMES.items()
+        if checkpoint_clock <= review_clock
+    ]
+    return applicable[-1] if applicable else None
 
 
 def live_review_timestamp(trade_date, review_label):
@@ -499,7 +519,6 @@ def get_live_next_trading_date(available_dates, trade_date):
 def build_live_directional_opportunity(symbol, day_1m, today_gate, reviews, exact_eleven_ready=True):
     rules = LIVE_DIRECTIONAL_DISTANCE_RULES[symbol]
     base = {
-        "priority": rules["priority"],
         "product_note": rules["product_note"],
         "headline_gate": today_gate,
         "candidates": [],
@@ -1116,7 +1135,7 @@ def fetch_live_technical_analysis(
     today_headline_status,
     next_headline_status,
 ):
-    target_time = live_review_timestamp(trade_date, review_label)
+    target_time = live_analysis_timestamp(trade_date, review_label)
 
     if trade_date > now_et.date():
         return {"error": "A future trading date cannot be analyzed."}
@@ -1154,64 +1173,103 @@ def fetch_live_technical_analysis(
             )
         }
 
-    reviews = {}
-    review_order = list(LIVE_REVIEW_TIMES)
-    selected_index = review_order.index(review_label)
-    for label in review_order[: selected_index + 1]:
-        label_time = live_review_timestamp(trade_date, label)
-        if trade_date < now_et.date() or now_et >= label_time:
-            reviews[label] = evaluate_live_technical_review(symbol, day_1m, day_15m, trade_date, label)
-
-    result = reviews.get(review_label)
-    if not result:
-        return {"error": f"The {review_label} review is not ready."}
-    if not result.get("ready"):
-        return {"error": result.get("message", "The technical review could not be completed.")}
-
-    next_trading_date = get_live_next_trading_date(available_dates, trade_date)
-    today_gate = build_live_headline_gate(
+    movement = build_market_movement_assessment(
+        symbol,
+        all_1m,
+        all_15m,
         trade_date,
+        review_label,
         today_headline_status,
-        review_label,
-        holding_window=False,
+        fomc_day=trade_date in LIVE_FOMC_DATES,
+        automatic_event=None,
+        include_historical_outcome=False,
     )
-    next_gate = build_live_headline_gate(
-        next_trading_date,
-        next_headline_status,
-        review_label,
-        holding_window=True,
-    )
-    foundational = build_live_foundational_assessment(
-        symbol,
-        review_label,
-        result,
-        reviews,
-        today_gate,
-    )
-    metrics = build_live_morning_metrics(day_15m, result)
-    next_day = build_live_next_day_assessment(
-        symbol,
-        foundational,
-        metrics,
-        today_gate,
-        next_gate,
-    )
-    directional = build_live_directional_opportunity(
-        symbol,
-        day_1m,
-        today_gate,
-        reviews,
-        exact_eleven_ready=(
-            trade_date < now_et.date()
-            or now_et >= datetime.combine(trade_date, clock_time(11, 1), tzinfo=EASTERN_ZONE)
-        ),
-    )
+
+    golden_review_label = applicable_live_golden_review(review_label)
+    reviews = {}
+    next_trading_date = get_live_next_trading_date(available_dates, trade_date)
+    result = None
+    golden_error = None
+    today_gate = None
+    next_gate = None
+    foundational = None
+    metrics = None
+    next_day = None
+    directional = None
+
+    if golden_review_label:
+        review_order = list(LIVE_REVIEW_TIMES)
+        selected_index = review_order.index(golden_review_label)
+        for label in review_order[: selected_index + 1]:
+            label_time = live_review_timestamp(trade_date, label)
+            if trade_date < now_et.date() or now_et >= label_time:
+                reviews[label] = evaluate_live_technical_review(
+                    symbol,
+                    day_1m,
+                    day_15m,
+                    trade_date,
+                    label,
+                )
+
+        result = reviews.get(golden_review_label)
+        if not result:
+            golden_error = f"The {golden_review_label} Golden review is not ready."
+        elif not result.get("ready"):
+            golden_error = result.get(
+                "message",
+                "The Golden technical review could not be completed.",
+            )
+        else:
+            today_gate = build_live_headline_gate(
+                trade_date,
+                today_headline_status,
+                golden_review_label,
+                holding_window=False,
+            )
+            next_gate = build_live_headline_gate(
+                next_trading_date,
+                next_headline_status,
+                golden_review_label,
+                holding_window=True,
+            )
+            foundational = build_live_foundational_assessment(
+                symbol,
+                golden_review_label,
+                result,
+                reviews,
+                today_gate,
+            )
+            metrics = build_live_morning_metrics(day_15m, result)
+            next_day = build_live_next_day_assessment(
+                symbol,
+                foundational,
+                metrics,
+                today_gate,
+                next_gate,
+            )
+            directional = build_live_directional_opportunity(
+                symbol,
+                day_1m,
+                today_gate,
+                reviews,
+                exact_eleven_ready=(
+                    trade_date < now_et.date()
+                    or now_et >= datetime.combine(
+                        trade_date,
+                        clock_time(11, 1),
+                        tzinfo=EASTERN_ZONE,
+                    )
+                ),
+            )
 
     return {
         "symbol": symbol,
         "review_label": review_label,
+        "golden_review_label": golden_review_label,
+        "golden_error": golden_error,
         "trade_date": trade_date,
         "next_trading_date": next_trading_date,
+        "movement": movement,
         "result": result,
         "reviews": reviews,
         "foundational": foundational,
@@ -1309,6 +1367,188 @@ def show_live_tool_status(message):
         st.error(message)
 
 
+def precise_movement_text(value):
+    number = safe_float(value, None)
+    if number is None or not math.isfinite(number):
+        return "—"
+    return f"{number:.8f}".rstrip("0").rstrip(".")
+
+
+def render_live_market_movement(movement):
+    st.subheader("Market Movement Strategy — Direction Neutral")
+    st.caption(
+        "Uses the locked symbol-specific rule for this exact checkpoint to estimate a "
+        "historical price envelope. It does not predict direction, guarantee a maximum, "
+        "choose an option contract, or carry a rule forward from another time."
+    )
+
+    status = movement.get("signal_status", "NO_SIGNAL_CONDITIONS")
+    if status == "ACTIVE_CURRENT_CONFIRMED":
+        st.success(status)
+    elif status.startswith(("SECONDARY", "RESEARCH_ONLY")):
+        st.warning(status)
+    else:
+        st.info(status)
+    st.caption(movement.get("reason", ""))
+
+    primary = movement.get("primary_results", {})
+    ordered_targets = [
+        target
+        for target in (TARGET_OPEN, TARGET_FRESH)
+        if target in primary
+    ]
+    if ordered_targets:
+        columns = st.columns(len(ordered_targets))
+        for column, target in zip(columns, ordered_targets):
+            signal = primary[target]
+            label = (
+                "Closest Fixed-Open Ceiling"
+                if target == TARGET_OPEN
+                else "Closest Fresh-Movement Ceiling"
+            )
+            column.metric(label, f"${signal['ceiling_points']:g}")
+            column.caption(
+                f"{signal['target_label']} · anchor ${signal['anchor_price']:.2f} · "
+                f"envelope ${signal['lower_boundary']:.2f} to "
+                f"${signal['upper_boundary']:.2f}"
+            )
+            column.caption(f"{signal['rule_id']} · {signal['rule_class']}")
+
+    combined = movement.get("combined_boundary")
+    if combined:
+        st.info(
+            "Conservative combined boundary when both independent anchor families "
+            f"qualify: ${combined['lower_boundary']:.2f} to "
+            f"${combined['upper_boundary']:.2f}. The formulas remain separate."
+        )
+
+    research_results = movement.get("research_results", [])
+    if research_results:
+        st.warning(
+            "Separately labeled research-only rules passed. They are shown for context "
+            "and do not replace a current-confirmed operating rule."
+        )
+        st.dataframe(
+            [
+                {
+                    "TARGET": signal["target_label"],
+                    "CEILING": f"${signal['ceiling_points']:g}",
+                    "EVIDENCE": signal["rule_class"],
+                    "ANCHOR": f"${signal['anchor_price']:.4f}",
+                    "LOWER BOUNDARY": f"${signal['lower_boundary']:.4f}",
+                    "UPPER BOUNDARY": f"${signal['upper_boundary']:.4f}",
+                    "RULE": signal["rule_id"],
+                }
+                for signal in research_results
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+    with st.expander("Why every movement rule passed or failed"):
+        st.markdown("**Gate results — evaluated in mandatory order**")
+        st.dataframe(
+            [
+                {
+                    "GATE": gate["name"],
+                    "RESULT": gate["status"],
+                    "PASSED": gate["passed"],
+                    "REASON": gate["reason"],
+                }
+                for gate in movement.get("gates", [])
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+        feature_order = ("O", "P", "M", "R", "R60", "A1", "A15", "G", "displacement")
+        feature_names = {
+            "O": "9:30 open (O)",
+            "P": "Last completed one-minute close (P)",
+            "M": "Maximum open distance so far (M / XND D)",
+            "R": "Range since open (R)",
+            "R60": "Recent 60-minute range (R60)",
+            "A1": "One-minute ATR(14) (A1)",
+            "A15": "Completed 15-minute ATR(14) (A15)",
+            "G": "Absolute overnight gap (G)",
+            "displacement": "Close displacement from open",
+        }
+        features = movement.get("features", {})
+        st.markdown("**Full-precision rule inputs**")
+        st.dataframe(
+            [
+                {
+                    "INPUT": feature_names[key],
+                    "VALUE": precise_movement_text(features.get(key)),
+                }
+                for key in feature_order
+                if key in features
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "Pass/fail uses full-precision values. Display rounding never changes a result."
+        )
+
+        candidates = movement.get("candidate_evaluations", [])
+        st.markdown("**Exact-time rule results**")
+        if not candidates:
+            st.info(
+                "No approved rule exists for this symbol at this exact checkpoint. "
+                "A rule from another time is never interpolated or carried forward."
+            )
+        else:
+            candidate_rows = []
+            condition_rows = []
+            for candidate in candidates:
+                failed = [
+                    item
+                    for item in candidate["condition_results"]
+                    if not item["passed"]
+                ]
+                why = (
+                    "; ".join(
+                        f"{item['feature']} {precise_movement_text(item['actual'])} "
+                        f"> {precise_movement_text(item['threshold'])}"
+                        for item in failed
+                    )
+                    if failed
+                    else "All required AND conditions passed at full precision."
+                )
+                candidate_rows.append(
+                    {
+                        "TARGET": TARGET_LABELS[candidate["target_kind"]],
+                        "TIER": (
+                            f"${candidate['ceiling']:g}"
+                            if candidate["target_kind"] != "ROUNDED_STRIKE_ONLY"
+                            else "$1 strike-only; not a movement cap"
+                        ),
+                        "EVIDENCE": candidate["evidence_class"],
+                        "DECISION": candidate["decision"],
+                        "WHY": why,
+                        "RULE": candidate["rule_id"],
+                    }
+                )
+                for condition in candidate["condition_results"]:
+                    condition_rows.append(
+                        {
+                            "RULE": candidate["rule_id"],
+                            "CONDITION": condition["label"],
+                            "REQUIREMENT": f"<= {precise_movement_text(condition['threshold'])}",
+                            "ACTUAL": precise_movement_text(condition["actual"]),
+                            "PASSED": condition["passed"],
+                        }
+                    )
+            st.dataframe(candidate_rows, width="stretch", hide_index=True)
+            st.markdown("**Condition-by-condition audit**")
+            st.dataframe(condition_rows, width="stretch", hide_index=True)
+            st.caption(
+                "Every listed condition is required. Passing two conditions never "
+                "overrides a failure on the third."
+            )
+
+
 def render_live_directional_section(opportunity):
     st.subheader("Directional Distance Opportunity — Separate Strategy")
     st.caption(
@@ -1318,12 +1558,11 @@ def render_live_directional_section(opportunity):
     show_live_tool_status(opportunity["result"])
     st.caption(opportunity["reason"])
     if opportunity.get("review_price") is not None:
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("Daily Priority", f"{opportunity['priority']} of 4")
-        d2.metric("9:30 Open", f"{opportunity['market_open']:.2f}")
-        d3.metric("Exact 11:00 Price", f"{opportunity['review_price']:.2f}")
-        d4.metric("Signed Move", f"{opportunity['signed_move']:+.2f}")
-        d5.metric("Direction / Side", f"{opportunity['direction']} → {opportunity['option_side']}")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("9:30 Open", f"{opportunity['market_open']:.2f}")
+        d2.metric("Exact 11:00 Price", f"{opportunity['review_price']:.2f}")
+        d3.metric("Signed Move", f"{opportunity['signed_move']:+.2f}")
+        d4.metric("Direction / Side", f"{opportunity['direction']} → {opportunity['option_side']}")
     if opportunity.get("candidates"):
         rows = [
             {
@@ -1347,7 +1586,7 @@ def render_live_directional_section(opportunity):
 
 
 def render_live_foundational_section(foundational):
-    st.subheader("1. Foundational Golden Filter")
+    st.subheader("Foundational Golden Filter")
     show_live_tool_status(foundational["result"])
     st.caption(foundational["description"])
     rows = []
@@ -1367,7 +1606,7 @@ def render_live_foundational_section(foundational):
 
 
 def render_live_next_day_section(next_day, trade_date, next_trading_date):
-    st.subheader("2. Next Day Expiration Golden Filter — 1DTE")
+    st.subheader("Next Day Expiration Golden Filter — 1DTE")
     show_live_tool_status(next_day["result"])
     st.caption(
         f"Entry date: {trade_date} | Next trading-day expiration: {next_trading_date}. "
@@ -1430,12 +1669,13 @@ def render_live_technical_status_box(decision):
 def render_live_technical_entry_check():
     now_et = datetime.now(EASTERN_ZONE)
     default_label = default_live_review_label(now_et)
-    review_labels = list(LIVE_REVIEW_TIMES)
+    review_labels = list(MOVEMENT_REVIEW_OPTIONS)
 
     st.title("Live Technical Entry Check")
     st.caption(
         "Step 2 — Tastytrade regular-session candles only. Mirrors the Research Engine's "
-        "Directional Distance, Foundational, and Next Day Expiration assessments; it never submits an order."
+        "Market Movement, Directional Distance, Foundational, and Next Day Expiration "
+        "assessments; it never submits an order."
     )
     st.warning(
         "Technical check only: a CLEAR result does not override the separate Step 1 headline-risk report."
@@ -1456,7 +1696,7 @@ def render_live_technical_entry_check():
             )
         with control_col3:
             review_label = st.selectbox(
-                "Technical Checkpoint",
+                "Analysis Checkpoint",
                 review_labels,
                 index=review_labels.index(default_label),
                 key="live_technical_review_label",
@@ -1490,6 +1730,12 @@ def render_live_technical_entry_check():
             type="primary",
             width="stretch",
         )
+
+    st.caption(
+        "The Market Movement rule runs only at the exact selected checkpoint. Before "
+        "11:00 AM it is the only strategy that runs. At and after 11:00 AM, the latest "
+        "applicable Golden and Directional checkpoint also runs."
+    )
 
     st.caption(
         f"Current Eastern time: {now_et.strftime('%A, %B %d, %Y at ')}"
@@ -1536,50 +1782,66 @@ def render_live_technical_entry_check():
             )
         return
 
-    result = payload["result"]
     st.caption(
         f"Showing completed assessment: {symbol} · {selected_date} · {review_label} · {chart_interval_label} | "
         f"Candle response coverage: {payload['available_first_date']} through {payload['available_last_date']}"
     )
-    render_live_technical_status_box(result["decision"])
+    render_live_market_movement(payload["movement"])
 
-    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5, metric_col6 = st.columns(6)
-    metric_col1.metric("9:30 Open", f"{result['market_open']:.2f}")
-    metric_col2.metric("Review Price", f"{result['review_price']:.2f}")
-    metric_col3.metric("Move From Open", f"{result['move_from_open']:.2f}")
-    metric_col4.metric("ATR(14), 15m", f"{result['atr']:.2f}")
-    metric_col5.metric("Largest 15m Body", f"{result['metrics']['max_body']:.2f}")
-    metric_col6.metric("Six-Candle Churn", f"{result['metrics']['churn']:.2f}")
-
-    direction = "ABOVE" if result["signed_move"] > 0 else "BELOW" if result["signed_move"] < 0 else "AT"
-    st.write(
-        f"**Checkpoint:** {review_label} &nbsp; | &nbsp; "
-        f"**Price is {direction} the open by {abs(result['signed_move']):.2f}**"
-    )
-
-    if result["flagged"]:
-        st.subheader("Why the review was flagged")
+    result = payload.get("result")
+    golden_review_label = payload.get("golden_review_label")
+    if golden_review_label is None:
+        st.info(
+            "Golden and Directional strategies do not load before 11:00 AM. "
+            "The exact-time Market Movement result and chart remain available."
+        )
+    elif payload.get("golden_error"):
+        st.error(
+            f"{golden_review_label} Golden checkpoint unavailable: "
+            f"{payload['golden_error']}"
+        )
     else:
-        st.subheader("Technical rule result")
-    for reason in result["reasons"]:
-        st.write(f"• {reason}")
+        st.markdown("---")
+        st.subheader(f"Golden Technical Checkpoint — {golden_review_label}")
+        render_live_technical_status_box(result["decision"])
 
-    st.subheader("Headline Gate Summary")
-    today_gate_col, next_gate_col = st.columns(2)
-    today_gate_col.metric("Selected Day / 0DTE", payload["today_gate"]["status"])
-    today_gate_col.caption(payload["today_gate"]["reason"])
-    next_gate_col.metric("Next Trading Day / 1DTE", payload["next_gate"]["status"])
-    next_gate_col.caption(payload["next_gate"]["reason"])
+        metric_col1, metric_col2, metric_col3, metric_col4, metric_col5, metric_col6 = st.columns(6)
+        metric_col1.metric("9:30 Open", f"{result['market_open']:.2f}")
+        metric_col2.metric("Review Price", f"{result['review_price']:.2f}")
+        metric_col3.metric("Move From Open", f"{result['move_from_open']:.2f}")
+        metric_col4.metric("ATR(14), 15m", f"{result['atr']:.2f}")
+        metric_col5.metric("Largest 15m Body", f"{result['metrics']['max_body']:.2f}")
+        metric_col6.metric("Six-Candle Churn", f"{result['metrics']['churn']:.2f}")
 
-    render_live_directional_section(payload["directional"])
-    render_live_foundational_section(payload["foundational"])
-    render_live_next_day_section(
-        payload["next_day"],
-        payload["trade_date"],
-        payload["next_trading_date"],
-    )
+        direction = "ABOVE" if result["signed_move"] > 0 else "BELOW" if result["signed_move"] < 0 else "AT"
+        st.write(
+            f"**Golden checkpoint:** {golden_review_label} &nbsp; | &nbsp; "
+            f"**Price is {direction} the open by {abs(result['signed_move']):.2f}**"
+        )
 
-    target = live_review_timestamp(payload["trade_date"], review_label)
+        if result["flagged"]:
+            st.subheader("Why the review was flagged")
+        else:
+            st.subheader("Technical rule result")
+        for reason in result["reasons"]:
+            st.write(f"• {reason}")
+
+        st.subheader("Headline Gate Summary")
+        today_gate_col, next_gate_col = st.columns(2)
+        today_gate_col.metric("Selected Day / 0DTE", payload["today_gate"]["status"])
+        today_gate_col.caption(payload["today_gate"]["reason"])
+        next_gate_col.metric("Next Trading Day / 1DTE", payload["next_gate"]["status"])
+        next_gate_col.caption(payload["next_gate"]["reason"])
+
+        render_live_directional_section(payload["directional"])
+        render_live_foundational_section(payload["foundational"])
+        render_live_next_day_section(
+            payload["next_day"],
+            payload["trade_date"],
+            payload["next_trading_date"],
+        )
+
+    target = live_analysis_timestamp(payload["trade_date"], review_label)
     chart_candles = resample_live_chart_candles(
         payload["day_1m"],
         LIVE_CHART_INTERVALS[chart_interval_label],
@@ -1588,12 +1850,19 @@ def render_live_technical_entry_check():
     if not chart_candles.empty:
         st.subheader("Price Chart Through the Selected Checkpoint")
         st.caption("Green/red candles use the actual session price range. The dashed blue line is the fixed 9:30 opening price.")
+        market_open = (
+            result["market_open"]
+            if result and result.get("ready")
+            else safe_float(payload["movement"].get("features", {}).get("O"), None)
+        )
+        if market_open is None:
+            market_open = float(payload["day_1m"].sort_values("timestamp_et").iloc[0]["open"])
         st.altair_chart(
             build_live_candlestick_chart(
                 chart_candles,
                 symbol,
                 selected_date,
-                result["market_open"],
+                market_open,
                 chart_interval_label,
             ),
             width="stretch",
@@ -1610,16 +1879,17 @@ def render_live_technical_entry_check():
             }
         )
     if review_rows:
-        st.subheader("Technical Checkpoints Through the Selected Review")
+        st.subheader("Golden Checkpoints Through the Selected Analysis Time")
         st.dataframe(review_rows, width="stretch", hide_index=True)
 
-    with st.expander("Show the six 15-minute bars and calculation inputs"):
-        detail = result["recent_bars"].copy()
-        detail["Time ET"] = detail["timestamp_et"].dt.strftime("%I:%M %p").str.lstrip("0")
-        detail["Body"] = (detail["close"] - detail["open"]).abs()
-        detail = detail[["Time ET", "open", "high", "low", "close", "Body", "true_range", "atr_14"]]
-        detail.columns = ["TIME ET", "OPEN", "HIGH", "LOW", "CLOSE", "BODY", "TRUE RANGE", "ATR(14)"]
-        st.dataframe(detail, width="stretch", hide_index=True)
+    if result and result.get("ready"):
+        with st.expander("Show the six Golden 15-minute bars and calculation inputs"):
+            detail = result["recent_bars"].copy()
+            detail["Time ET"] = detail["timestamp_et"].dt.strftime("%I:%M %p").str.lstrip("0")
+            detail["Body"] = (detail["close"] - detail["open"]).abs()
+            detail = detail[["Time ET", "open", "high", "low", "close", "Body", "true_range", "atr_14"]]
+            detail.columns = ["TIME ET", "OPEN", "HIGH", "LOW", "CLOSE", "BODY", "TRUE RANGE", "ATR(14)"]
+            st.dataframe(detail, width="stretch", hide_index=True)
 
     st.caption(
         f"Tastytrade streamer symbol: {payload['streamer_symbol']} | "
@@ -1644,15 +1914,16 @@ TASTYTRADE_BASE_URL = "https://api.tastyworks.com"
 # Kept in display order so the scanner selector is grouped by instrument type.
 # The API still receives only the raw ticker symbol.
 OPTIONS_SYMBOL_CATALOG = [
-    # ETFs
+    # Major symbols
     {"symbol": "QQQ", "instrument_type": "ETF"},
     {"symbol": "SPY", "instrument_type": "ETF"},
+    {"symbol": "XSP", "instrument_type": "INDEX"},
+    {"symbol": "XND", "instrument_type": "INDEX"},
+    # Other ETFs
     {"symbol": "IWM", "instrument_type": "ETF"},
     {"symbol": "DIA", "instrument_type": "ETF"},
     {"symbol": "TLT", "instrument_type": "ETF"},
-    # Index options
-    {"symbol": "XSP", "instrument_type": "INDEX"},
-    {"symbol": "XND", "instrument_type": "INDEX"},
+    # Other index options
     {"symbol": "SPXW", "instrument_type": "INDEX"},
     {"symbol": "NDXP", "instrument_type": "INDEX"},
     {"symbol": "RUTW", "instrument_type": "INDEX"},
@@ -1676,7 +1947,6 @@ OPTIONS_SYMBOL_DEFAULT_LABELS = [
     OPTIONS_SYMBOL_LABEL_BY_TICKER["QQQ"],
     OPTIONS_SYMBOL_LABEL_BY_TICKER["SPY"],
     OPTIONS_SYMBOL_LABEL_BY_TICKER["XSP"],
-    OPTIONS_SYMBOL_LABEL_BY_TICKER["XND"],
 ]
 
 
@@ -2072,7 +2342,7 @@ def calculate_tastytrade_spread_flag(short_quote, long_quote, credit, bid_ask_wi
     return "Quoted"
 
 
-def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, selected_sides, selected_widths, max_rows):
+def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, selected_sides, selected_widths):
     board_rows = []
     errors = []
 
@@ -2262,9 +2532,6 @@ def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, sel
         ),
     )
 
-    if max_rows and len(board_rows) > int(max_rows):
-        board_rows = board_rows[:int(max_rows)]
-
     return board_rows, errors
 
 
@@ -2444,76 +2711,90 @@ def get_public_options_rows(board_rows):
     ]
 
 
-def select_farthest_instant_credit_row(board_rows, symbol, side):
-    candidates = []
+def is_out_of_money_credit_spread(row):
+    current_price = safe_float(row.get("Current"), None)
+    short_strike = safe_float(row.get("Short Strike"), None)
+    if current_price is None or current_price <= 0 or short_strike is None:
+        return False
 
-    for row in board_rows:
-        if row.get("Symbol") != symbol or row.get("Side") != side:
-            continue
+    side = row.get("Side")
+    if side == "Put Credit":
+        return short_strike < current_price
+    if side == "Call Credit":
+        return short_strike > current_price
+    return False
 
-        natural_credit = safe_float(row.get("Instant Credit"), 0.0)
-        distance_from_open = safe_float(row.get("_Distance From Open"), None)
 
-        if natural_credit <= 0 or distance_from_open is None or distance_from_open < 0:
-            continue
-
-        candidates.append(row)
-
-    if not candidates:
-        return None
-
-    return max(
-        candidates,
+def get_positive_otm_instant_credit_rows(board_rows, symbol):
+    rows = [
+        row
+        for row in board_rows
+        if row.get("Symbol") == symbol
+        and safe_float(row.get("Instant Credit"), 0.0) > 0
+        and is_out_of_money_credit_spread(row)
+    ]
+    return sorted(
+        rows,
         key=lambda row: (
-            safe_float(row.get("_Distance From Open"), 0.0),
-            safe_float(row.get("Instant Credit"), 0.0),
+            0 if row.get("Side") == "Put Credit" else 1,
             safe_float(row.get("Width"), 0.0),
+            safe_float(row.get("Distance"), 0.0),
+            safe_float(row.get("Short Strike"), 0.0),
         ),
     )
 
 
 def render_instant_credit_calculations(board_rows, selected_symbols):
     st.markdown("---")
-    st.subheader("Instant Credit Calculations")
+    st.subheader("All Positive OTM Instant Credits")
     st.caption(
-        "For each selected symbol, this shows the farthest Call and Put spread from today's open "
-        "that has a positive natural credit (short bid minus long ask)."
+        "Shows every selected-width spread with a positive natural credit (short-leg bid "
+        "minus long-leg ask) whose short strike is out of the money at the current underlying "
+        "price. Put short strike must be below current; Call short strike must be above current. "
+        "Distance from the 9:30 open is informational and never filters a row."
     )
 
     for symbol in selected_symbols:
         st.markdown(f"### {symbol} Instant Credits")
-        summary_rows = []
-
-        for side, type_label in [("Call Credit", "CALL"), ("Put Credit", "PUT")]:
-            best_row = select_farthest_instant_credit_row(board_rows, symbol, side)
-
-            if not best_row:
-                continue
-
-            summary_rows.append({
-                "TYPE": type_label,
-                "STRIKES": (
-                    f'{format_options_number(best_row.get("Short Strike"))} - '
-                    f'{format_options_number(best_row.get("Long Strike"))}'
-                ),
-                "DISTANCE FROM OPEN": format_options_number(best_row.get("_Distance From Open")),
-                "INSTANT CREDIT": f'{safe_float(best_row.get("Instant Credit"), 0.0):.2f}',
-            })
-
-        if summary_rows:
+        qualifying_rows = get_positive_otm_instant_credit_rows(board_rows, symbol)
+        if qualifying_rows:
+            summary_rows = [
+                {
+                    "TYPE": "PUT" if row.get("Side") == "Put Credit" else "CALL",
+                    "SHORT STRIKE": format_options_number(row.get("Short Strike")),
+                    "LONG STRIKE": format_options_number(row.get("Long Strike")),
+                    "WIDTH": format_options_number(row.get("Width")),
+                    "INSTANT CREDIT": format_options_number(row.get("Instant Credit")),
+                    "DISTANCE FROM CURRENT": format_options_number(row.get("Distance")),
+                    "DISTANCE FROM OPEN": format_options_number(row.get("_Distance From Open")),
+                    "EXP": row.get("Expiration") or "—",
+                }
+                for row in qualifying_rows
+            ]
             st.dataframe(
                 summary_rows,
                 width="stretch",
                 hide_index=True,
             )
+            widths = sorted({safe_float(row.get("Width"), 0.0) for row in qualifying_rows})
+            st.caption(
+                f"{len(qualifying_rows)} positive-credit OTM spreads shown. "
+                f"Widths represented: {', '.join(format_options_number(width) for width in widths)}."
+            )
         else:
             symbol_rows = [row for row in board_rows if row.get("Symbol") == symbol]
-            open_is_available = any(safe_float(row.get("_Open Price"), 0.0) > 0 for row in symbol_rows)
+            current_is_available = any(safe_float(row.get("Current"), 0.0) > 0 for row in symbol_rows)
 
-            if symbol_rows and not open_is_available:
-                st.info(f"{symbol}: today's opening price was unavailable, so distance-from-open calculations could not be completed.")
+            if symbol_rows and not current_is_available:
+                st.info(
+                    f"{symbol}: the current underlying price was unavailable, so the app "
+                    "could not safely determine which short strikes were OTM."
+                )
             else:
-                st.info(f"{symbol}: no instant-credit Call or Put spread is available for the current selections.")
+                st.info(
+                    f"{symbol}: no positive-credit OTM Call or Put spread is available "
+                    "for the selected expiration, sides, and widths."
+                )
 
 def render_options_opportunity_board():
     st.markdown(
@@ -2572,7 +2853,7 @@ def render_options_opportunity_board():
             OPTIONS_SYMBOL_SELECTOR_OPTIONS,
             default=OPTIONS_SYMBOL_DEFAULT_LABELS,
             key="options_board_symbols",
-            help="Ordered by group: ETFs, index options, then stocks. The scanner uses the raw ticker behind each label.",
+            help="QQQ, SPY, XSP, and XND are listed first, followed by the remaining ETFs, indices, and stocks.",
         )
         selected_symbols = get_options_tickers_from_labels(selected_symbol_labels)
 
@@ -2651,7 +2932,6 @@ def render_options_opportunity_board():
         selected_expiration_date_text,
         tuple(selected_sides),
         tuple(selected_widths),
-        int(max_rows),
     )
 
     cached_options_board_key = st.session_state.get("options_board_cache_key")
@@ -2674,7 +2954,6 @@ def render_options_opportunity_board():
                 selected_expiration_date=selected_expiration_date_text,
                 selected_sides=selected_sides,
                 selected_widths=selected_widths,
-                max_rows=int(max_rows),
             )
 
         st.session_state["options_board_cache_key"] = options_board_cache_key
@@ -2687,14 +2966,16 @@ def render_options_opportunity_board():
     if credit_range_error:
         st.warning(credit_range_error)
 
-    visible_board_rows = apply_options_credit_range_filter(board_rows, credit_range_filter)
+    filtered_board_rows = apply_options_credit_range_filter(board_rows, credit_range_filter)
+    visible_board_rows = filtered_board_rows[: int(max_rows)]
     credit_filter_caption = "All credits"
 
     if credit_range_filter:
         credit_filter_caption = f"Credit filter: {credit_range_filter.get('display_text', str(credit_range_text))}"
 
     st.caption(
-        f"Rows shown: {len(visible_board_rows)} of {len(board_rows)} | Default sort: Credit descending | "
+        f"Board rows shown: {len(visible_board_rows)} of {len(filtered_board_rows)} passing the board filter "
+        f"({len(board_rows)} spreads scanned) | Default sort: Credit descending | "
         f"Symbols: {', '.join(selected_symbol_labels)} | Expiration: {selected_expiration_date_text} | "
         f"Widths: {', '.join(str(width) for width in selected_widths)} | "
         f"{credit_filter_caption}"
@@ -2706,15 +2987,14 @@ def render_options_opportunity_board():
 
     if not visible_board_rows:
         st.info("No option spread rows pass the current Credit Range Filter.")
-        return
+    else:
+        st.dataframe(
+            get_public_options_rows(visible_board_rows),
+            width="stretch",
+            hide_index=True,
+        )
 
-    st.dataframe(
-        get_public_options_rows(visible_board_rows),
-        width="stretch",
-        hide_index=True,
-    )
-
-    render_instant_credit_calculations(visible_board_rows, selected_symbols)
+    render_instant_credit_calculations(board_rows, selected_symbols)
 
 
 st.sidebar.markdown("### Live Trading Workflow")
