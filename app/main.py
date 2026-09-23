@@ -10,6 +10,10 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from daily_price_forecast import build_daily_price_forecast, render_daily_price_forecast
+from live_strategy_bridge import evaluate_rare_history, completed_analysis_snapshot, render_added_strategy_sections, RARE_HISTORY_MESSAGE
+from available_trades import render_live_available_trades
+
 from market_movement import (
     MOVEMENT_REVIEW_CLOCKS,
     MOVEMENT_REVIEW_OPTIONS,
@@ -1015,7 +1019,7 @@ def evaluate_live_technical_review(symbol, day_1m, day_15m, trade_date, review_l
     }
 
 
-async def download_tastytrade_candle_events(symbol, start_time):
+async def download_tastytrade_candle_events(symbol, start_time, interval="1m"):
     try:
         from tastytrade import DXLinkStreamer, Session
         from tastytrade.dxfeed import Candle
@@ -1046,7 +1050,7 @@ async def download_tastytrade_candle_events(symbol, start_time):
         async with DXLinkStreamer(session) as streamer:
             await streamer.subscribe_candle(
                 [streamer_symbol],
-                "1m",
+                interval,
                 start_time=start_time,
                 extended_trading_hours=False,
                 refresh_interval=0.1,
@@ -1102,7 +1106,10 @@ def candle_events_to_dataframe(candle_payload):
         except Exception:
             continue
 
-        if min(open_price, high_price, low_price, close_price) <= 0:
+        if (not all(math.isfinite(v) for v in (open_price, high_price, low_price, close_price))
+                or min(open_price, high_price, low_price, close_price) <= 0
+                or high_price < max(open_price, close_price, low_price)
+                or low_price > min(open_price, close_price, high_price)):
             continue
 
         rows.append(
@@ -1127,6 +1134,63 @@ def candle_events_to_dataframe(candle_payload):
     return frame.reset_index(drop=True)
 
 
+async def download_live_assessment_history(symbol, trade_date):
+    # Enough minute history for the forecast's 60-session context; the provider
+    # may return less. Daily history is a separate, small Rare request.
+    minute_start = datetime.combine(trade_date - timedelta(days=180), clock_time(9, 30), tzinfo=EASTERN_ZONE)
+    daily_start = datetime.combine(trade_date - timedelta(days=5 * 366), clock_time(0, 0), tzinfo=EASTERN_ZONE)
+    minute, daily = await asyncio.gather(
+        download_tastytrade_candle_events(symbol, minute_start),
+        download_tastytrade_candle_events(symbol, daily_start, "1d"),
+        return_exceptions=True,
+    )
+    if isinstance(minute, Exception):
+        raise minute
+    return minute, daily
+
+
+def daily_candle_events_to_dataframe(payload, trade_date):
+    if isinstance(payload, Exception):
+        return pd.DataFrame()
+    rows = []
+    for candle in payload.get("candles", []):
+        try:
+            stamp = pd.to_datetime(int(candle.time), unit="ms", utc=True).tz_convert(EASTERN_ZONE)
+            prices = [float(getattr(candle, field)) for field in ("open", "high", "low", "close")]
+            if (stamp.date() >= trade_date or not all(math.isfinite(value) and value > 0 for value in prices)
+                    or prices[1] < max(prices) or prices[2] > min(prices)):
+                continue
+            rows.append(dict(zip(("open", "high", "low", "close"), prices),
+                             session=pd.Timestamp(stamp.date()), volume=safe_float(getattr(candle, "volume", 0), 0.0)))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    if not rows:
+        return pd.DataFrame()
+    daily = pd.DataFrame(rows).drop_duplicates("session", keep="last").set_index("session").sort_index()
+    return daily
+
+
+def build_live_prior_day_reference(symbol, history, trade_date, review_label, today_gate):
+    base = {"ready": False, "inputs": {"selected_date": trade_date}}
+    if review_label != "9:40 AM":
+        return {**base, "message": "Runs at the 9:40 AM checkpoint using the previous trading session's directional references."}
+    import pandas_market_calendars as calendars
+    sessions = calendars.get_calendar("NYSE").valid_days(trade_date - timedelta(days=14), trade_date - timedelta(days=1))
+    if sessions.empty:
+        return {**base, "message": "The preceding trading session is unavailable."}
+    previous_date = sessions[-1].date()
+    if previous_date.weekday() == 4:
+        return {**base, "previous_date": previous_date,
+                "message": f"The preceding session is Friday, {previous_date}. Friday 1DTE entries are not used, so there is no prior-day strike to recheck."}
+    day = history[history.trade_date == previous_date].copy()
+    if day.empty or day.iloc[0].timestamp_et.time() != clock_time(9, 30):
+        return {**base, "message": f"The preceding session's opening data are unavailable for {previous_date}."}
+    opportunity = build_live_directional_opportunity(symbol, day, today_gate, {}, exact_eleven_ready=True)
+    opportunity.update(symbol=symbol, trade_date=previous_date, active=bool(opportunity.get("candidates")))
+    return {**base, "ready": bool(opportunity.get("candidates")), "previous_date": previous_date,
+            "opportunity": opportunity, "message": opportunity.get("reason", "Prior-day reference unavailable.")}
+
+
 def fetch_live_technical_analysis(
     symbol,
     review_label,
@@ -1147,11 +1211,8 @@ def fetch_live_technical_analysis(
             )
         }
 
-    warmup_date = trade_date - timedelta(days=8)
-    start_time = datetime.combine(warmup_date, clock_time(9, 30), tzinfo=EASTERN_ZONE)
-
     try:
-        candle_payload = asyncio.run(download_tastytrade_candle_events(symbol, start_time))
+        candle_payload, daily_payload = asyncio.run(download_live_assessment_history(symbol, trade_date))
     except Exception as exc:
         return {"error": f"Live/historical candle data unavailable for {symbol}: {exc}"}
 
@@ -1159,6 +1220,11 @@ def fetch_live_technical_analysis(
     if all_1m.empty:
         return {"error": f"Tastytrade returned no usable regular-session candles for {symbol}."}
 
+    # One-minute timestamps label bar starts. Discard the current forming bar,
+    # including for the independent exact-11:00 Directional calculation.
+    all_1m = all_1m[all_1m.timestamp_et + pd.Timedelta(minutes=1) <= pd.Timestamp(now_et)].copy()
+    if all_1m.empty:
+        return {"error": f"No completed regular-session candles are available for {symbol}."}
     available_dates = sorted(all_1m["trade_date"].unique())
     all_15m = build_live_15m_candles(all_1m)
     day_1m = all_1m[all_1m["trade_date"] == trade_date].copy()
@@ -1190,8 +1256,8 @@ def fetch_live_technical_analysis(
     next_trading_date = get_live_next_trading_date(available_dates, trade_date)
     result = None
     golden_error = None
-    today_gate = None
-    next_gate = None
+    today_gate = build_live_headline_gate(trade_date, today_headline_status, golden_review_label or review_label, holding_window=False)
+    next_gate = build_live_headline_gate(next_trading_date, next_headline_status, golden_review_label or review_label, holding_window=True)
     foundational = None
     metrics = None
     next_day = None
@@ -1262,8 +1328,23 @@ def fetch_live_technical_analysis(
                 ),
             )
 
-    return {
+    forecast = build_daily_price_forecast(symbol, all_1m, trade_date, target_time.time(), today_gate)
+    daily = daily_candle_events_to_dataframe(daily_payload, trade_date)
+    try:
+        rare = evaluate_rare_history(symbol, daily, trade_date, golden_review_label, foundational, metrics, today_gate, next_gate)
+    except (ValueError, TypeError, KeyError, IndexError) as exc:
+        rare = {"result": "DAILY HISTORY UNAVAILABLE", "description": RARE_HISTORY_MESSAGE,
+                "conditions": [], "strike": None, "history_days": len(daily), "history_note": str(exc)}
+    if isinstance(daily_payload, Exception):
+        rare["history_note"] = "The live daily-history request was unavailable. Other strategies use the minute feed."
+    elif daily_payload.get("snapshot_snipped") or daily_payload.get("snapshot_incomplete"):
+        rare["history_note"] = "The provider limited the daily snapshot; the displayed calculation uses only returned completed daily sessions."
+    morning_recheck = build_live_prior_day_reference(symbol, all_1m, trade_date, review_label, today_gate)
+    payload = {
         "symbol": symbol,
+        "analysis_cutoff": target_time,
+        "golden_cutoff": live_review_timestamp(trade_date, golden_review_label) if golden_review_label else None,
+        "daily_price_forecast": forecast, "rare": rare, "morning_recheck": morning_recheck,
         "review_label": review_label,
         "golden_review_label": golden_review_label,
         "golden_error": golden_error,
@@ -1288,6 +1369,8 @@ def fetch_live_technical_analysis(
         "snapshot_incomplete": candle_payload.get("snapshot_incomplete", False),
         "resolution_note": candle_payload.get("resolution_note", ""),
     }
+    payload["analysis_snapshot"] = completed_analysis_snapshot(payload)
+    return payload
 
 
 def resample_live_chart_candles(day_1m, interval, cutoff):
@@ -1674,8 +1757,8 @@ def render_live_technical_entry_check():
     st.title("Live Technical Entry Check")
     st.caption(
         "Step 2 — Tastytrade regular-session candles only. Mirrors the Research Engine's "
-        "Market Movement, Directional Distance, Foundational, and Next Day Expiration "
-        "assessments; it never submits an order."
+        "Daily Price Boundary, Market Movement, Directional Distance, Foundational, 1DTE, "
+        "Rare Golden Fingerprint, and prior-day reference assessments; it never submits an order."
     )
     st.warning(
         "Technical check only: a CLEAR result does not override the separate Step 1 headline-risk report."
@@ -1733,8 +1816,9 @@ def render_live_technical_entry_check():
 
     st.caption(
         "The Market Movement rule runs only at the exact selected checkpoint. Before "
-        "11:00 AM it is the only strategy that runs. At and after 11:00 AM, the latest "
-        "applicable Golden and Directional checkpoint also runs."
+        "11:00 AM the Daily Price Boundary forecast and Market Movement can run, plus "
+        "the prior-day reference check at 9:40 AM. At and after 11:00 AM the latest "
+        "applicable Golden checkpoint also runs; Directional needs the completed 11:00 candle."
     )
 
     st.caption(
@@ -1782,18 +1866,20 @@ def render_live_technical_entry_check():
             )
         return
 
+    if "analysis_snapshot" not in payload:
+        st.info("Run the complete assessment again to load the updated strategies.")
+        return
+
     st.caption(
         f"Showing completed assessment: {symbol} · {selected_date} · {review_label} · {chart_interval_label} | "
         f"Candle response coverage: {payload['available_first_date']} through {payload['available_last_date']}"
     )
-    render_live_market_movement(payload["movement"])
-
     result = payload.get("result")
     golden_review_label = payload.get("golden_review_label")
     if golden_review_label is None:
         st.info(
             "Golden and Directional strategies do not load before 11:00 AM. "
-            "The exact-time Market Movement result and chart remain available."
+            "The Daily Price Boundary forecast, exact-time Market Movement result, and chart remain available."
         )
     elif payload.get("golden_error"):
         st.error(
@@ -1826,20 +1912,20 @@ def render_live_technical_entry_check():
         for reason in result["reasons"]:
             st.write(f"• {reason}")
 
-        st.subheader("Headline Gate Summary")
-        today_gate_col, next_gate_col = st.columns(2)
-        today_gate_col.metric("Selected Day / 0DTE", payload["today_gate"]["status"])
-        today_gate_col.caption(payload["today_gate"]["reason"])
-        next_gate_col.metric("Next Trading Day / 1DTE", payload["next_gate"]["status"])
-        next_gate_col.caption(payload["next_gate"]["reason"])
+    st.subheader("Headline Gate Summary")
+    today_gate_col, next_gate_col = st.columns(2)
+    today_gate_col.metric("Selected Day / 0DTE", payload["today_gate"]["status"])
+    today_gate_col.caption(payload["today_gate"]["reason"])
+    next_gate_col.metric("Next Trading Day / 1DTE", payload["next_gate"]["status"])
+    next_gate_col.caption(payload["next_gate"]["reason"])
 
+    render_daily_price_forecast(payload["daily_price_forecast"])
+    render_live_market_movement(payload["movement"])
+    if result and result.get("ready"):
         render_live_directional_section(payload["directional"])
         render_live_foundational_section(payload["foundational"])
-        render_live_next_day_section(
-            payload["next_day"],
-            payload["trade_date"],
-            payload["next_trading_date"],
-        )
+        render_live_next_day_section(payload["next_day"], payload["trade_date"], payload["next_trading_date"])
+    render_added_strategy_sections(payload)
 
     target = live_analysis_timestamp(payload["trade_date"], review_label)
     chart_candles = resample_live_chart_candles(
@@ -1943,49 +2029,6 @@ OPTIONS_SYMBOL_TICKER_BY_LABEL = {
     for ticker, label in OPTIONS_SYMBOL_LABEL_BY_TICKER.items()
 }
 OPTIONS_SYMBOL_SELECTOR_OPTIONS = list(OPTIONS_SYMBOL_TICKER_BY_LABEL.keys())
-OPTIONS_SYMBOL_DEFAULT_LABELS = [
-    OPTIONS_SYMBOL_LABEL_BY_TICKER["QQQ"],
-    OPTIONS_SYMBOL_LABEL_BY_TICKER["SPY"],
-    OPTIONS_SYMBOL_LABEL_BY_TICKER["XSP"],
-]
-
-
-def normalize_options_selector_symbols(selected_values):
-    """Convert older raw-ticker session values to the new readable labels."""
-    if not isinstance(selected_values, list):
-        return list(OPTIONS_SYMBOL_DEFAULT_LABELS)
-
-    normalized_labels = []
-
-    for selected_value in selected_values:
-        value = str(selected_value or "").strip().upper()
-
-        if selected_value in OPTIONS_SYMBOL_TICKER_BY_LABEL:
-            label = selected_value
-        elif value in OPTIONS_SYMBOL_LABEL_BY_TICKER:
-            label = OPTIONS_SYMBOL_LABEL_BY_TICKER[value]
-        else:
-            continue
-
-        if label not in normalized_labels:
-            normalized_labels.append(label)
-
-    return normalized_labels
-
-
-def ensure_options_selector_state():
-    state_key = "options_board_symbols"
-
-    if state_key not in st.session_state:
-        st.session_state[state_key] = list(OPTIONS_SYMBOL_DEFAULT_LABELS)
-        return
-
-    normalized_labels = normalize_options_selector_symbols(st.session_state.get(state_key))
-
-    if normalized_labels != st.session_state.get(state_key):
-        st.session_state[state_key] = normalized_labels
-
-
 def get_options_tickers_from_labels(selected_labels):
     return [
         OPTIONS_SYMBOL_TICKER_BY_LABEL[label]
@@ -2480,11 +2523,14 @@ def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, sel
                 short_volume = tastytrade_quote_float(short_quote, "volume")
                 long_volume = tastytrade_quote_float(long_quote, "volume")
 
+                quote_values = (short_bid, short_ask, long_bid, long_ask)
+                if (not short_quote or not long_quote
+                        or not all(math.isfinite(value) and value >= 0 for value in quote_values)
+                        or short_bid <= 0 or long_ask <= 0
+                        or short_ask < short_bid or long_ask < long_bid):
+                    continue
                 natural_credit = round(short_bid - long_ask, 4)
-                short_mid = (short_bid + short_ask) / 2 if short_bid > 0 and short_ask > 0 else tastytrade_quote_float(short_quote, "mark")
-                long_mid = (long_bid + long_ask) / 2 if long_bid > 0 and long_ask > 0 else tastytrade_quote_float(long_quote, "mark")
-                mid_credit = round(short_mid - long_mid, 4)
-                display_credit = natural_credit if natural_credit > 0 else mid_credit
+                display_credit = natural_credit
                 max_risk = round(float(spread["spread_width"]) - max(display_credit, 0), 4)
 
                 if spread["side"] == "Put Credit":
@@ -2521,6 +2567,9 @@ def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, sel
                     "Long Symbol": spread["long_symbol"],
                     "_Open Price": round(open_price, 4) if open_price else None,
                     "_Distance From Open": distance_from_open,
+                    "_Short Quote Time": short_quote.get("updated-at"),
+                    "_Long Quote Time": long_quote.get("updated-at"),
+                    "_Underlying Quote Time": underlying_quote.get("updated-at"),
                 })
 
     board_rows = sorted(
@@ -2537,155 +2586,8 @@ def build_tastytrade_spread_rows(selected_symbols, selected_expiration_date, sel
 
 
 def parse_options_spread_widths(widths_text):
-    widths = []
-
-    for raw_item in re.split(r"[,\s]+", str(widths_text or "")):
-        cleaned = raw_item.strip()
-
-        if not cleaned:
-            continue
-
-        try:
-            width = float(cleaned)
-        except Exception:
-            continue
-
-        if width <= 0:
-            continue
-
-        if width not in widths:
-            widths.append(width)
-
-    return widths
-
-
-def normalize_options_credit_filter_value(value):
-    value = safe_float(value, None)
-
-    if value is None:
-        return None
-
-    return value
-
-
-def parse_options_credit_range_filter(range_text):
-    cleaned = str(range_text or "").strip().lower()
-
-    if not cleaned:
-        return None, None
-
-    cleaned = (
-        cleaned.replace("$", "")
-        .replace("credits", "")
-        .replace("credit", "")
-        .replace("premiums", "")
-        .replace("premium", "")
-        .replace("–", "-")
-        .replace("—", "-")
-        .strip()
-    )
-
-    compact = re.sub(r"\s+", "", cleaned)
-    compact = compact.replace("to", "-").replace(",", "-")
-
-    number_pattern = r"\d+(?:\.\d+)?"
-
-    range_match = re.fullmatch(
-        rf"({number_pattern})-({number_pattern})",
-        compact,
-    )
-
-    if range_match:
-        min_credit = normalize_options_credit_filter_value(range_match.group(1))
-        max_credit = normalize_options_credit_filter_value(range_match.group(2))
-
-        if min_credit is None or max_credit is None:
-            return None, "Credit Range Filter could not read one of the numbers."
-
-        if min_credit > max_credit:
-            min_credit, max_credit = max_credit, min_credit
-
-        return {
-            "min_credit": min_credit,
-            "max_credit": max_credit,
-            "display_text": f"{min_credit:g} to {max_credit:g}",
-        }, None
-
-    greater_match = re.fullmatch(
-        rf">=?({number_pattern})|({number_pattern})\+",
-        compact,
-    )
-
-    if greater_match:
-        raw_value = greater_match.group(1) or greater_match.group(2)
-        min_credit = normalize_options_credit_filter_value(raw_value)
-
-        if min_credit is None:
-            return None, "Credit Range Filter could not read the minimum credit."
-
-        return {
-            "min_credit": min_credit,
-            "max_credit": None,
-            "display_text": f">= {min_credit:g}",
-        }, None
-
-    less_match = re.fullmatch(
-        rf"<=?({number_pattern})",
-        compact,
-    )
-
-    if less_match:
-        max_credit = normalize_options_credit_filter_value(less_match.group(1))
-
-        if max_credit is None:
-            return None, "Credit Range Filter could not read the maximum credit."
-
-        return {
-            "min_credit": None,
-            "max_credit": max_credit,
-            "display_text": f"<= {max_credit:g}",
-        }, None
-
-    single_match = re.fullmatch(rf"({number_pattern})", compact)
-
-    if single_match:
-        min_credit = normalize_options_credit_filter_value(single_match.group(1))
-
-        if min_credit is None:
-            return None, "Credit Range Filter could not read the credit."
-
-        return {
-            "min_credit": min_credit,
-            "max_credit": None,
-            "display_text": f">= {min_credit:g}",
-        }, None
-
-    return None, "Use a credit range like 0.05-0.10, 0.05 to 0.10, >=0.05, <=0.10, or 0.05+."
-
-
-def apply_options_credit_range_filter(board_rows, credit_filter):
-    if not credit_filter:
-        return board_rows
-
-    min_credit = credit_filter.get("min_credit")
-    max_credit = credit_filter.get("max_credit")
-    filtered_rows = []
-
-    for row in board_rows:
-        credit = safe_float(row.get("Credit"), None)
-
-        if credit is None:
-            continue
-
-        if min_credit is not None and credit < min_credit:
-            continue
-
-        if max_credit is not None and credit > max_credit:
-            continue
-
-        filtered_rows.append(row)
-
-    return filtered_rows
+    value = str(widths_text or "").strip()
+    return [float(value)] if re.fullmatch(r"[1-9]", value) else []
 
 
 def format_options_number(value):
@@ -2847,20 +2749,16 @@ def render_options_opportunity_board():
     control_col1, control_col2, control_col3, control_col4 = st.columns([1.45, 1.2, 1.2, 0.85])
 
     with control_col1:
-        ensure_options_selector_state()
-        selected_symbol_labels = st.multiselect(
-            "Symbols",
-            OPTIONS_SYMBOL_SELECTOR_OPTIONS,
-            default=OPTIONS_SYMBOL_DEFAULT_LABELS,
-            key="options_board_symbols",
-            help="QQQ, SPY, XSP, and XND are listed first, followed by the remaining ETFs, indices, and stocks.",
+        selected_symbol_label = st.selectbox(
+            "Symbol", OPTIONS_SYMBOL_SELECTOR_OPTIONS, key="options_board_symbol_single",
+            help="QQQ, SPY, XSP, and XND are listed first. One symbol per tab.",
         )
-        selected_symbols = get_options_tickers_from_labels(selected_symbol_labels)
+        selected_symbols = [OPTIONS_SYMBOL_TICKER_BY_LABEL[selected_symbol_label]]
 
     with control_col2:
         selected_expiration_date = st.date_input(
             "Expiration Date",
-            value=datetime.now().date(),
+            value=datetime.now(EASTERN_ZONE).date(),
             key="options_board_expiration_date",
             help="Choose the exact option expiration date to match from Tastytrade. Today shows today's expirations; tomorrow shows tomorrow's expirations.",
         )
@@ -2885,49 +2783,24 @@ def render_options_opportunity_board():
             key="options_board_max_rows",
         )
 
-    width_col1, width_col2, width_col3 = st.columns([1.4, 1.35, 3.2])
-
+    width_col1, width_col2 = st.columns([1, 3])
     with width_col1:
         spread_widths_text = st.text_input(
-            "Spread Widths",
-            value=st.session_state.get("options_board_widths_text", "1,2,3"),
-            key="options_board_widths_text",
-            placeholder="1,2,3,5,10,20,50,100",
-            help="Type any widths you want, separated by commas. Example: 1,2,3,5,10,20,50,100",
+            "Spread Width", value="1", max_chars=1, key="options_board_width_single",
+            placeholder="1", help="Enter one digit from 1 to 9. Only this width is shown.",
         )
         selected_widths = parse_options_spread_widths(spread_widths_text)
-
     with width_col2:
-        credit_range_text = st.text_input(
-            "Credit Range Filter",
-            value=st.session_state.get("options_board_credit_range_filter", ""),
-            key="options_board_credit_range_filter",
-            placeholder="0.05-0.10",
-            help="Optional. Blank shows all credits. Examples: 0.05-0.10, >=0.05, <=0.10, or 0.05+.",
-        )
-        credit_range_filter, credit_range_error = parse_options_credit_range_filter(credit_range_text)
-
-    with width_col3:
-        refresh_clicked = st.button(
-            "REFRESH OPTIONS BOARD",
-            key="options_board_refresh",
-            type="primary",
-            width="stretch",
-        )
-
-    if not selected_symbols:
-        st.warning("Select at least one symbol.")
-        return
-
-    if not selected_sides:
-        st.warning("Select Put Credit, Call Credit, or both.")
-        return
-
-    if not selected_widths:
-        st.warning("Enter at least one valid spread width, like 1,2,3,5,10,20,50,100.")
+        refresh_clicked = st.button("REFRESH OPTIONS BOARD", key="options_board_refresh", type="primary", width="stretch")
+    if not selected_sides or not selected_widths:
+        st.warning("Select a side and enter one spread-width digit from 1 to 9.")
+        render_live_available_trades(
+            (st.session_state.get("live_technical_payload") or {}).get("analysis_snapshot"),
+            [], selected_symbols[0], None, selected_widths)
         return
 
     options_board_cache_key = (
+        "single-symbol-natural-credit-v2",
         tuple(selected_symbols),
         selected_expiration_date_text,
         tuple(selected_sides),
@@ -2948,13 +2821,19 @@ def render_options_opportunity_board():
         board_rows = st.session_state["options_board_rows"]
         errors = st.session_state["options_board_errors"]
     else:
+        st.session_state["options_board_rows"] = []
+        st.session_state["options_board_retrieved_at"] = None
         with st.spinner("Pulling Tastytrade option chains and quotes..."):
-            board_rows, errors = build_tastytrade_spread_rows(
-                selected_symbols=selected_symbols,
-                selected_expiration_date=selected_expiration_date_text,
-                selected_sides=selected_sides,
-                selected_widths=selected_widths,
-            )
+            try:
+                board_rows, errors = build_tastytrade_spread_rows(
+                    selected_symbols=selected_symbols,
+                    selected_expiration_date=selected_expiration_date_text,
+                    selected_sides=selected_sides,
+                    selected_widths=selected_widths,
+                )
+            except Exception as exc:
+                board_rows, errors = [], [f"Option-chain refresh failed: {exc}"]
+        st.session_state["options_board_retrieved_at"] = datetime.now(EASTERN_ZONE).isoformat()
 
         st.session_state["options_board_cache_key"] = options_board_cache_key
         st.session_state["options_board_rows"] = board_rows
@@ -2963,38 +2842,24 @@ def render_options_opportunity_board():
     for error in errors:
         st.error(error)
 
-    if credit_range_error:
-        st.warning(credit_range_error)
-
-    filtered_board_rows = apply_options_credit_range_filter(board_rows, credit_range_filter)
-    visible_board_rows = filtered_board_rows[: int(max_rows)]
-    credit_filter_caption = "All credits"
-
-    if credit_range_filter:
-        credit_filter_caption = f"Credit filter: {credit_range_filter.get('display_text', str(credit_range_text))}"
-
+    qualifying_rows = get_positive_otm_instant_credit_rows(board_rows, selected_symbols[0])
+    visible_board_rows = qualifying_rows[: int(max_rows)]
     st.caption(
-        f"Board rows shown: {len(visible_board_rows)} of {len(filtered_board_rows)} passing the board filter "
-        f"({len(board_rows)} spreads scanned) | Default sort: Credit descending | "
-        f"Symbols: {', '.join(selected_symbol_labels)} | Expiration: {selected_expiration_date_text} | "
-        f"Widths: {', '.join(str(width) for width in selected_widths)} | "
-        f"{credit_filter_caption}"
+        f"Board rows shown: {len(visible_board_rows)} of {len(qualifying_rows)} positive-credit OTM spreads | "
+        f"Symbol: {selected_symbol_label} | Expiration: {selected_expiration_date_text} | Width: {selected_widths[0]:g}. "
+        "The complete instant-credit inventory below is not limited by Max Rows."
     )
-
-    if not board_rows:
-        st.info("No option spread rows loaded yet, or Tastytrade did not return quote/chain data for the current settings. Click REFRESH OPTIONS BOARD again after confirming credentials.")
-        return
-
     if not visible_board_rows:
-        st.info("No option spread rows pass the current Credit Range Filter.")
+        st.info("Nothing available at this time.")
     else:
-        st.dataframe(
-            get_public_options_rows(visible_board_rows),
-            width="stretch",
-            hide_index=True,
-        )
-
+        st.dataframe(get_public_options_rows(visible_board_rows), width="stretch", hide_index=True)
     render_instant_credit_calculations(board_rows, selected_symbols)
+
+    # Absolute bottom of Step 3. Reuse this chain and the completed assessment;
+    # no background symbol downloads, strategy reruns, or hypothetical trades.
+    render_live_available_trades(
+        (st.session_state.get("live_technical_payload") or {}).get("analysis_snapshot"),
+        board_rows, selected_symbols[0], st.session_state.get("options_board_retrieved_at"), selected_widths)
 
 
 st.sidebar.markdown("### Live Trading Workflow")
