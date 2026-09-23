@@ -1768,24 +1768,30 @@ def render_live_technical_entry_check():
     default_label = default_live_review_label(now_et)
     review_labels = list(MOVEMENT_REVIEW_OPTIONS)
 
-    st.title("Live Technical Entry Check")
+    st.title("Technical Analysis")
     st.caption(
-        "Step 2 — Tastytrade regular-session candles only. Mirrors the Research Engine's "
+        "Tastytrade regular-session candles only. Mirrors the Research Engine's "
         "Daily Price Boundary, Market Movement, Directional Distance, Foundational, 1DTE, "
         "Rare Golden Fingerprint, and prior-day reference assessments; it never submits an order."
     )
     st.warning(
-        "Technical check only: a CLEAR result does not override the separate Step 1 headline-risk report."
+        "Technical check only: a CLEAR result does not override the separate headline-risk report."
     )
 
-    with st.form("live_technical_assessment_form", clear_on_submit=False):
+    # Save selections as they change, even before Run is clicked. A form would
+    # keep unsubmitted edits in the browser and lose them when hidden.
+    with st.container(border=True):
         control_col1, control_col2, control_col3, control_col4 = st.columns(4)
         with control_col1:
-            symbol = st.selectbox("Symbol", LIVE_TECHNICAL_SYMBOLS, key="live_technical_symbol")
+            symbol = st.selectbox(
+                "Symbol", LIVE_TECHNICAL_SYMBOLS,
+                index=LIVE_TECHNICAL_SYMBOLS.index(live_input_default("live_technical_symbol", LIVE_TECHNICAL_SYMBOLS[0])),
+                key="live_technical_symbol",
+            )
         with control_col2:
             selected_date = st.date_input(
                 "Trading Date",
-                value=now_et.date(),
+                value=live_input_default("live_technical_date", now_et.date()),
                 min_value=date(2001, 9, 9),
                 max_value=now_et.date(),
                 key="live_technical_date",
@@ -1795,23 +1801,24 @@ def render_live_technical_entry_check():
             review_label = st.selectbox(
                 "Analysis Checkpoint",
                 review_labels,
-                index=review_labels.index(default_label),
+                index=review_labels.index(live_input_default("live_technical_review_label", default_label)),
                 key="live_technical_review_label",
             )
         with control_col4:
             chart_interval_label = st.selectbox(
                 "Chart Timeframe",
                 list(LIVE_CHART_INTERVALS),
-                index=2,
+                index=list(LIVE_CHART_INTERVALS).index(live_input_default("live_technical_chart_interval", list(LIVE_CHART_INTERVALS)[2])),
                 key="live_technical_chart_interval",
             )
 
-        st.markdown("**Step 1 Headline Results — enter the conclusions from your separate phone report**")
+        st.markdown("**Headline Results — enter the conclusions from your separate phone report**")
         gate_col1, gate_col2 = st.columns(2)
         with gate_col1:
             today_headline_status = st.selectbox(
                 "Selected trading day / 0DTE",
                 LIVE_HEADLINE_OPTIONS,
+                index=LIVE_HEADLINE_OPTIONS.index(live_input_default("live_today_headline_status", LIVE_HEADLINE_OPTIONS[0])),
                 key="live_today_headline_status",
                 help="Monitor allows entry when the technical engine is clear. Wait delays entry; Suggest skip blocks it.",
             )
@@ -1819,11 +1826,13 @@ def render_live_technical_entry_check():
             next_headline_status = st.selectbox(
                 "Next trading day / 1DTE holding window",
                 LIVE_HEADLINE_OPTIONS,
+                index=LIVE_HEADLINE_OPTIONS.index(live_input_default("live_next_headline_status", LIVE_HEADLINE_OPTIONS[0])),
                 key="live_next_headline_status",
                 help="The 1DTE tool requires both today's and the next trading day's headline gates to permit entry.",
             )
-        run_clicked = st.form_submit_button(
+        run_clicked = st.button(
             "RUN COMPLETE TECHNICAL ASSESSMENT",
+            key="live_technical_run",
             type="primary",
             width="stretch",
         )
@@ -2747,7 +2756,7 @@ def render_options_opportunity_board():
     )
 
     st.markdown('<div class="options-title">Options Opportunity Board</div>', unsafe_allow_html=True)
-    st.markdown('<div class="options-readonly-badge">READ ONLY — no trade execution on this page</div>', unsafe_allow_html=True)
+    st.markdown('<div class="options-readonly-badge">READ ONLY — no trade execution</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="options-help">Tastytrade scanner for vertical credit spreads. Default sort is highest quoted credit/premium first. Filters control visibility only; no orders are sent.</div>',
         unsafe_allow_html=True,
@@ -2765,6 +2774,7 @@ def render_options_opportunity_board():
     with control_col1:
         selected_symbol_label = st.selectbox(
             "Symbol", OPTIONS_SYMBOL_SELECTOR_OPTIONS, key="options_board_symbol_single",
+            index=OPTIONS_SYMBOL_SELECTOR_OPTIONS.index(live_input_default("options_board_symbol_single", OPTIONS_SYMBOL_SELECTOR_OPTIONS[0])),
             help="QQQ, SPY, XSP, and XND are listed first. One symbol per tab.",
         )
         selected_symbols = [OPTIONS_SYMBOL_TICKER_BY_LABEL[selected_symbol_label]]
@@ -2772,7 +2782,7 @@ def render_options_opportunity_board():
     with control_col2:
         selected_expiration_date = st.date_input(
             "Expiration Date",
-            value=datetime.now(EASTERN_ZONE).date(),
+            value=live_input_default("options_board_expiration_date", datetime.now(EASTERN_ZONE).date()),
             key="options_board_expiration_date",
             help="Choose the exact option expiration date to match from Tastytrade. Today shows today's expirations; tomorrow shows tomorrow's expirations.",
         )
@@ -2783,7 +2793,7 @@ def render_options_opportunity_board():
         selected_sides = st.multiselect(
             "Sides",
             ["Put Credit", "Call Credit"],
-            default=["Put Credit", "Call Credit"],
+            default=live_input_default("options_board_sides", ["Put Credit", "Call Credit"]),
             key="options_board_sides",
         )
 
@@ -2792,7 +2802,7 @@ def render_options_opportunity_board():
             "Max Rows",
             min_value=50,
             max_value=10000,
-            value=5000,
+            value=live_input_default("options_board_max_rows", 5000),
             step=50,
             key="options_board_max_rows",
         )
@@ -2800,7 +2810,8 @@ def render_options_opportunity_board():
     width_col1, width_col2 = st.columns([1, 3])
     with width_col1:
         spread_widths_text = st.text_input(
-            "Spread Width", value="1", max_chars=1, key="options_board_width_single",
+            "Spread Width", value=live_input_default("options_board_width_single", "1"),
+            max_chars=1, key="options_board_width_single",
             placeholder="1", help="Enter one digit from 1 to 9. Only this width is shown.",
         )
         selected_widths = parse_options_spread_widths(spread_widths_text)
@@ -2869,21 +2880,51 @@ def render_options_opportunity_board():
         st.dataframe(get_public_options_rows(visible_board_rows), width="stretch", hide_index=True)
     render_instant_credit_calculations(board_rows, selected_symbols)
 
-    # Absolute bottom of Step 3. Reuse this chain and the completed assessment;
+    # Absolute bottom of the board. Reuse this chain and the completed assessment;
     # no background symbol downloads, strategy reruns, or hypothetical trades.
     render_live_available_trades(
         (st.session_state.get("live_technical_payload") or {}).get("analysis_snapshot"),
         board_rows, selected_symbols[0], st.session_state.get("options_board_retrieved_at"), selected_widths)
 
 
-st.sidebar.markdown("### Live Trading Workflow")
-selected_live_page = st.sidebar.radio(
-    "Page",
-    ["Step 2 — Technical Entry Check", "Step 3 — Options Opportunity Board"],
-    key="live_app_page",
+LIVE_WORKFLOW_INPUT_KEYS = (
+    "live_technical_symbol", "live_technical_date", "live_technical_review_label",
+    "live_technical_chart_interval", "live_today_headline_status", "live_next_headline_status",
+    "options_board_symbol_single", "options_board_expiration_date", "options_board_sides",
+    "options_board_max_rows", "options_board_width_single",
 )
 
-if selected_live_page == "Step 2 — Technical Entry Check":
-    render_live_technical_entry_check()
-else:
-    render_options_opportunity_board()
+
+def live_input_default(key, default):
+    return st.session_state.get("live_workflow_inputs", {}).get(key, default)
+
+
+def remember_live_workflow_inputs():
+    # Widget keys are removed when their section is hidden. Keep an independent
+    # copy of selections; never copy buttons or change cached data/as-of times.
+    selections = dict(st.session_state.get("live_workflow_inputs", {}))
+    for key in LIVE_WORKFLOW_INPUT_KEYS:
+        if key in st.session_state:
+            selections[key] = st.session_state[key]
+    st.session_state["live_workflow_inputs"] = selections
+
+
+def render_live_trading_workflow():
+    remember_live_workflow_inputs()
+    st.sidebar.markdown("### Show Sections")
+    show_technical = st.sidebar.checkbox("Technical Analysis", value=True, key="show_live_technical")
+    show_options = st.sidebar.checkbox("Options Opportunity Board", value=True, key="show_live_options")
+    st.sidebar.caption("Selections and completed results are kept while a section is hidden.")
+
+    if show_technical:
+        render_live_technical_entry_check()
+    if show_technical and show_options:
+        st.divider()
+    if show_options:
+        render_options_opportunity_board()
+    if not show_technical and not show_options:
+        st.info("Select a section in the sidebar to show it.")
+    remember_live_workflow_inputs()
+
+
+render_live_trading_workflow()
