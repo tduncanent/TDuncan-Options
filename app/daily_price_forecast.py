@@ -84,7 +84,47 @@ def tree_prediction(model: dict, values: np.ndarray) -> float:
     return result
 
 
-def _prior_features(prior: pd.DataFrame) -> dict:
+def _hourly_daily_history(prior_hourly: pd.DataFrame, selected_date) -> pd.DataFrame:
+    """Seven clock-hour RTH bars reproduce a full session's OHLC.
+
+    The feed is requested with tho=true and its default clock-hour alignment:
+    09:00 contains only 09:30–09:59; 15:00 ends at 16:00. No minute candles
+    are invented. Today's hourly bars and shortened sessions are excluded.
+    """
+    columns = ["day_open", "day_high", "day_low", "day_close"]
+    if prior_hourly is None or prior_hourly.empty:
+        return pd.DataFrame(columns=columns)
+    frame = prior_hourly.copy()
+    frame["timestamp_et"] = pd.to_datetime(frame.timestamp_et, utc=True).dt.tz_convert("America/New_York")
+    frame = frame[frame.timestamp_et.dt.date < selected_date].sort_values("timestamp_et")
+    frame = frame.drop_duplicates("timestamp_et", keep="last")
+    frame["trade_date"] = frame.timestamp_et.dt.date
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    import pandas_market_calendars as calendars
+    schedule = calendars.get_calendar("NYSE").schedule(
+        start_date=frame.trade_date.min(), end_date=frame.trade_date.max()
+    )
+    full_sessions = set(schedule.index[(schedule.market_close - schedule.market_open) == pd.Timedelta(minutes=390)].date)
+    records = []
+    for session, bars in frame.groupby("trade_date", sort=True):
+        expected = pd.date_range(f"{session} 09:00", periods=7, freq="h", tz="America/New_York")
+        if not pd.DatetimeIndex(bars.timestamp_et).equals(expected) or session not in full_sessions:
+            continue
+        prices = bars[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+        if (not np.isfinite(prices.to_numpy()).all() or (prices <= 0).any().any()
+                or (prices.high < prices[["open", "close", "low"]].max(axis=1)).any()
+                or (prices.low > prices[["open", "close", "high"]].min(axis=1)).any()):
+            continue
+        records.append({"trade_date": session, "day_open": float(prices.iloc[0].open),
+                        "day_high": float(prices.high.max()), "day_low": float(prices.low.min()),
+                        "day_close": float(prices.iloc[-1].close)})
+    if not records:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(records).set_index("trade_date").sort_index()
+
+
+def _prior_features(prior: pd.DataFrame, prior_hourly=None, selected_date=None) -> dict:
     daily = prior.groupby("trade_date", sort=True).agg(
         count=("close", "size"), first=("timestamp_et", "first"), last=("timestamp_et", "last"),
         day_open=("open", "first"), day_high=("high", "max"),
@@ -94,14 +134,36 @@ def _prior_features(prior: pd.DataFrame) -> dict:
         daily["count"].eq(390) & daily["first"].dt.strftime("%H:%M").eq("09:30")
         & daily["last"].dt.strftime("%H:%M").eq("15:59")
     ].copy()
+    minute_count = len(complete)
+    hourly = _hourly_daily_history(prior_hourly, selected_date) if selected_date is not None else pd.DataFrame()
+    hourly_count = len(hourly)
+    overlap_count = 0
+    if hourly_count:
+        overlap = complete.index.intersection(hourly.index)
+        fields = ["day_open", "day_high", "day_low", "day_close"]
+        if len(overlap) == 0:
+            raise ValueError("Longer hourly history was returned, but no complete prior day overlaps the minute feed to verify its regular-session OHLC.")
+        matches = np.isclose(complete.loc[overlap, fields].to_numpy(float),
+                             hourly.loc[overlap, fields].to_numpy(float), atol=1e-6, rtol=0).all(axis=1)
+        if not matches.all():
+            first_mismatch = overlap[np.flatnonzero(~matches)[0]]
+            raise ValueError(f"Hourly and one-minute regular-session OHLC disagree on {first_mismatch}; the longer history is not used until its session data can be verified.")
+        overlap_count = len(overlap)
+        # Minute data take precedence on overlapping verified sessions.
+        complete = pd.concat([hourly, complete[fields]])
+        complete = complete[~complete.index.duplicated(keep="last")].sort_index()
     if len(complete) < 30:
-        raise ValueError("At least 30 complete prior sessions are needed for the researched volatility inputs.")
+        raise ValueError(f"At least 30 complete prior sessions are needed for the researched volatility inputs; "
+                         f"received {minute_count} from one-minute history and {hourly_count} from hourly history "
+                         f"({len(complete)} distinct complete sessions).")
     complete["day_range"] = complete.day_high - complete.day_low
     complete["day_max_open_dist"] = np.maximum(
         complete.day_high - complete.day_open, complete.day_open - complete.day_low
     )
     complete["day_close_abs_move"] = (complete.day_close - complete.day_open).abs()
-    result = {}
+    result = {"prior_history_info": {"complete_sessions": len(complete), "minute_sessions": minute_count,
+                                    "hourly_sessions": hourly_count, "verified_overlap_sessions": overlap_count,
+                                    "first_date": str(complete.index[0]), "last_date": str(complete.index[-1])}}
     for window in (3, 5, 10, 20, 60):
         for column, short in (("day_max_open_dist", "maxdist"), ("day_range", "range")):
             sample = complete[column].tail(window)
@@ -120,7 +182,7 @@ def _prior_features(prior: pd.DataFrame) -> dict:
     return result
 
 
-def forecast_features(history: pd.DataFrame, trade_date, clock: str, input_mode="source_indicators") -> tuple[dict, pd.DataFrame]:
+def forecast_features(history: pd.DataFrame, trade_date, clock: str, input_mode="source_indicators", prior_hourly=None) -> tuple[dict, pd.DataFrame]:
     """Reproduce research schema 2 from prior days and completed current bars."""
     selected = pd.Timestamp(trade_date).date()
     cutoff = pd.Timestamp(f"{selected} {clock}", tz="America/New_York")
@@ -141,7 +203,7 @@ def forecast_features(history: pd.DataFrame, trade_date, clock: str, input_mode=
     prior = past[past.trade_date < selected]
     if prior.empty:
         raise ValueError("Prior-session history is unavailable.")
-    prior_values = _prior_features(prior)
+    prior_values = _prior_features(prior, prior_hourly, selected)
     close = ohlc.close.to_numpy(float)
     opening_price, price = float(ohlc.iloc[0].open), float(close[-1])
     high, low = float(ohlc.high.max()), float(ohlc.low.min())
@@ -267,7 +329,7 @@ def historical_outcome(history: pd.DataFrame, trade_date, clock: str, ranges: di
     }
 
 
-def build_daily_price_forecast(symbol, history, trade_date, review_clock, headline_gate) -> dict:
+def build_daily_price_forecast(symbol, history, trade_date, review_clock, headline_gate, prior_hourly=None) -> dict:
     clock = review_clock.strftime("%H:%M")
     base = {"strategy": STRATEGY_NAME, "symbol": symbol, "date": str(trade_date), "clock": clock,
             "available": False, "ranges": {}}
@@ -284,7 +346,7 @@ def build_daily_price_forecast(symbol, history, trade_date, review_clock, headli
             first = bundle["folds"][0]["valid_from"]
             last = bundle["folds"][-1]["valid_through"]
             return {**base, "status": "NO PRIOR-DATE MODEL", "reason": f"Prior-date models for {symbol} cover {first} through {last}. Earlier dates are initial training/calibration; later dates require an updated model."}
-        features, visible = forecast_features(history, trade_date, clock, bundle.get("input_mode", "source_indicators"))
+        features, visible = forecast_features(history, trade_date, clock, bundle.get("input_mode", "source_indicators"), prior_hourly)
         ranges = predict_ranges(bundle, fold, features, clock)
     except (OSError, ValueError, KeyError) as exc:
         return {**base, "status": "FORECAST UNAVAILABLE", "reason": str(exc)}
@@ -296,6 +358,7 @@ def build_daily_price_forecast(symbol, history, trade_date, review_clock, headli
         "headline_gate": gate, "pre_headline": clock < "11:00", "ranges": ranges,
         "market_open": features["day_open"], "review_price": features["review_price"],
         "last_candle": str(visible.iloc[-1].timestamp_et), "features": features,
+        "prior_history": features.get("prior_history_info", {}),
         "model_window": {k: fold[k] for k in ("valid_from", "valid_through", "training_through", "calibration_through")},
         "model_version": bundle["model_version"], "input_mode": bundle.get("input_mode"),
         "training_days": fold["training_days"], "calibration_days": fold["calibration_days"],
@@ -373,6 +436,13 @@ def render_daily_price_forecast(forecast: dict) -> None:
         st.caption("The typical range is a point-estimate range, not a calibrated 90% or 95% boundary. It is not automatically selected in the final summary.")
     with st.expander("Forecast inputs, method, and accuracy at every checkpoint"):
         features = forecast["features"]
+        prior = forecast.get("prior_history", {})
+        if prior:
+            st.caption(f"Prior volatility inputs: {prior['complete_sessions']} complete sessions, "
+                       f"{prior['first_date']} through {prior['last_date']}. "
+                       f"Minute history supplied {prior['minute_sessions']}; hourly regular-session history supplied "
+                       f"{prior['hourly_sessions']}, with {prior['verified_overlap_sessions']} overlapping sessions checked. "
+                       "Overlaps count once. Today's price structure and ATR still use one-minute candles.")
         st.dataframe([
             {"Input": "9:30 open", "Value": _display_number(features["day_open"])},
             {"Input": "Last completed price", "Value": _display_number(features["review_price"])},

@@ -1019,7 +1019,7 @@ def evaluate_live_technical_review(symbol, day_1m, day_15m, trade_date, review_l
     }
 
 
-async def download_tastytrade_candle_events(symbol, start_time, interval="1m"):
+async def download_tastytrade_candle_events(symbol, start_time, interval="1m", additional_intervals=None):
     try:
         from tastytrade import DXLinkStreamer, Session
         from tastytrade.dxfeed import Candle
@@ -1036,64 +1036,76 @@ async def download_tastytrade_candle_events(symbol, start_time, interval="1m"):
 
     streamer_symbol = symbol
     resolution_note = ""
-    candles = []
-    snapshot_complete = False
-    snapshot_snipped = False
+    starts = {interval: start_time, **(additional_intervals or {})}
+    snapshots = {period: {"candles": [], "snapshot_snipped": False, "snapshot_incomplete": True}
+                 for period in starts}
+    snapshot_ended = set()
+    completed = set()
+    aliases = {"m": "1m", "h": "1h", "d": "1d"}
 
+    # Share one connection across all periods. A one-minute SNAPSHOT_SNIP must
+    # not end the hourly or daily subscription before its own snapshot arrives.
     async with Session(provider_secret, refresh_token) as session:
         try:
             instrument = await Equity.get(session, symbol)
             streamer_symbol = str(getattr(instrument, "streamer_symbol", "") or symbol).strip()
         except Exception as exc:
             resolution_note = f"Instrument lookup used the raw {symbol} symbol: {exc}"
-
         async with DXLinkStreamer(session) as streamer:
-            await streamer.subscribe_candle(
-                [streamer_symbol],
-                interval,
-                start_time=start_time,
-                extended_trading_hours=False,
-                refresh_interval=0.1,
-            )
+            for period, beginning in starts.items():
+                try:
+                    await streamer.subscribe_candle(
+                        [streamer_symbol], period, start_time=beginning,
+                        extended_trading_hours=False, refresh_interval=0.1,
+                    )
+                except Exception as exc:
+                    if period == interval:
+                        raise
+                    # A denied auxiliary history request must not stop the
+                    # existing strategies from using today's minute candles.
+                    snapshots[period]["error"] = str(exc)
+                    completed.add(period)
             deadline = time.monotonic() + 55.0
-
-            while len(candles) < 60000:
+            while len(completed) < len(starts):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-
                 try:
-                    candle = await asyncio.wait_for(
-                        streamer.get_event(Candle),
-                        timeout=min(5.0, remaining),
-                    )
+                    candle = await asyncio.wait_for(streamer.get_event(Candle), timeout=min(5.0, remaining))
                 except TimeoutError:
-                    break
-
+                    # Auxiliary snapshots can start after the minute snapshot.
+                    # An idle gap is not their completion marker; respect the
+                    # bounded overall deadline instead of dropping them early.
+                    continue
+                event_symbol = str(getattr(candle, "event_symbol", ""))
+                period = event_symbol.partition("{=")[2].split(",")[0].split("}")[0]
+                period = aliases.get(period, period)
+                if not period and len(starts) == 1:
+                    period = interval
+                if period not in snapshots or period in completed:
+                    continue
+                snapshot = snapshots[period]
                 if not candle.remove:
-                    candles.append(candle)
-
+                    snapshot["candles"].append(candle)
                 if candle.snapshot_end or candle.snapshot_snip:
-                    snapshot_complete = True
-                    snapshot_snipped = bool(candle.snapshot_snip)
-                    break
+                    snapshot_ended.add(period)
+                    snapshot["snapshot_snipped"] = bool(candle.snapshot_snip)
+                if period in snapshot_ended and not getattr(candle, "pending", False):
+                    snapshot["snapshot_incomplete"] = False
+                    completed.add(period)
+                elif len(snapshot["candles"]) >= 60000:
+                    completed.add(period)
 
-    if not snapshot_complete and not candles:
-        raise RuntimeError(
-            f"Tastytrade did not finish the {symbol} candle snapshot within the live-app limit. "
-            "Choose a more recent date or tap RUN LIVE TECHNICAL CHECK again."
-        )
-
-    return {
-        "candles": candles,
-        "streamer_symbol": streamer_symbol,
-        "snapshot_snipped": snapshot_snipped,
-        "snapshot_incomplete": not snapshot_complete,
-        "resolution_note": resolution_note,
-    }
+    primary = snapshots[interval]
+    if primary["snapshot_incomplete"] and not primary["candles"]:
+        raise RuntimeError(f"Tastytrade did not return the {symbol} {interval} snapshot within the live-app limit.")
+    for period, snapshot in snapshots.items():
+        snapshot.update(streamer_symbol=streamer_symbol, resolution_note=resolution_note, interval=period)
+    primary["related_snapshots"] = {period: snapshot for period, snapshot in snapshots.items() if period != interval}
+    return primary
 
 
-def candle_events_to_dataframe(candle_payload):
+def candle_events_to_dataframe(candle_payload, regular_start=clock_time(9, 30)):
     rows = []
 
     for candle in candle_payload.get("candles", []):
@@ -1129,23 +1141,21 @@ def candle_events_to_dataframe(candle_payload):
     frame = pd.DataFrame(rows).sort_values("timestamp_et")
     frame = frame.drop_duplicates(subset=["timestamp_et"], keep="last").reset_index(drop=True)
     clocks = frame["timestamp_et"].dt.time
-    frame = frame[(clocks >= clock_time(9, 30)) & (clocks < clock_time(16, 0))].copy()
+    frame = frame[(clocks >= regular_start) & (clocks < clock_time(16, 0))].copy()
     frame["trade_date"] = frame["timestamp_et"].dt.date
     return frame.reset_index(drop=True)
 
 
 async def download_live_assessment_history(symbol, trade_date):
-    # Enough minute history for the forecast's 60-session context; the provider
-    # may return less. Daily history is a separate, small Rare request.
+    # The feed's minute-history cap is insufficient for 30 complete prior
+    # sessions. Hourly regular-session candles have a longer permitted history.
     minute_start = datetime.combine(trade_date - timedelta(days=180), clock_time(9, 30), tzinfo=EASTERN_ZONE)
+    hourly_start = datetime.combine(trade_date - timedelta(days=285), clock_time(9, 0), tzinfo=EASTERN_ZONE)
     daily_start = datetime.combine(trade_date - timedelta(days=5 * 366), clock_time(0, 0), tzinfo=EASTERN_ZONE)
-    minute, daily = await asyncio.gather(
-        download_tastytrade_candle_events(symbol, minute_start),
-        download_tastytrade_candle_events(symbol, daily_start, "1d"),
-        return_exceptions=True,
+    minute = await download_tastytrade_candle_events(
+        symbol, minute_start, additional_intervals={"1h": hourly_start, "1d": daily_start}
     )
-    if isinstance(minute, Exception):
-        raise minute
+    daily = minute["related_snapshots"]["1d"]
     return minute, daily
 
 
@@ -1328,7 +1338,11 @@ def fetch_live_technical_analysis(
                 ),
             )
 
-    forecast = build_daily_price_forecast(symbol, all_1m, trade_date, target_time.time(), today_gate)
+    hourly_payload = candle_payload.get("related_snapshots", {}).get("1h", {})
+    hourly_history = candle_events_to_dataframe(hourly_payload, regular_start=clock_time(9, 0))
+    forecast = build_daily_price_forecast(
+        symbol, all_1m, trade_date, target_time.time(), today_gate, prior_hourly=hourly_history
+    )
     daily = daily_candle_events_to_dataframe(daily_payload, trade_date)
     try:
         rare = evaluate_rare_history(symbol, daily, trade_date, golden_review_label, foundational, metrics, today_gate, next_gate)
