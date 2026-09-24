@@ -345,13 +345,8 @@ def render_available_trades(result):
                     "Credit": row["credit"], "Credit / width": row["credit_per_width"],
                     "Distance from price": row["distance_from_price"],
                     "Strategy support": row["support_label"],
-                    "Comparison strategy": comparison.get("strategy", "No applicable reference"),
                     "Suggested short (reference only)": comparison.get("strike"),
                     "Points inside suggested strike": comparison.get("inside_points"),
-                    "Strategy references": "; ".join(
-                        f"{ref['strategy']}: {number(ref['strike'])}, "
-                        f"as of {_time_text(ref['as_of'])} (age {_age_text(ref['age'])})"
-                        for ref in row["comparisons"]),
                     "Original Movement signal": "; ".join(dict.fromkeys(
                         _time_text(ref["movement_signal_time"]) for ref in row["comparisons"]
                         if ref.get("movement_signal_time"))) or "—",
