@@ -12,6 +12,8 @@ import math
 import pandas as pd
 import streamlit as st
 
+from boundary_layers import boundary_strategy_labels
+
 EASTERN = "America/New_York"
 REGULAR_SESSION_END = time(16, 0)
 
@@ -118,11 +120,12 @@ def capture_trade_analysis(snapshot, day):
             and forecast.get("symbol") == symbol and _date(forecast.get("date")) == session):
         last = _stamp(forecast.get("last_candle"))
         forecast_time = last + pd.Timedelta(minutes=1) if last is not None else None
+        boundary_labels = boundary_strategy_labels(forecast)
         # Use the same 90/95 references already included in the existing summary.
         for level in ("90", "95"):
             band = forecast.get("ranges", {}).get(level, {})
             for side in ("CALL", "PUT"):
-                add(f"Daily Price Boundary Strategy ({level}%)", side,
+                add(boundary_labels[level][side], side,
                     band.get(f"{side.lower()}_strike"), forecast_time)
 
     movement = snapshot.get("market_movement") or {}
