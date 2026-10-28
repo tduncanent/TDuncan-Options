@@ -2772,12 +2772,16 @@ def render_options_opportunity_board():
     control_col1, control_col2, control_col3, control_col4 = st.columns([1.45, 1.2, 1.2, 0.85])
 
     with control_col1:
-        selected_symbol_label = st.selectbox(
-            "Symbol", OPTIONS_SYMBOL_SELECTOR_OPTIONS, key="options_board_symbol_single",
-            index=OPTIONS_SYMBOL_SELECTOR_OPTIONS.index(live_input_default("options_board_symbol_single", OPTIONS_SYMBOL_SELECTOR_OPTIONS[0])),
-            help="QQQ, SPY, XSP, and XND are listed first. One symbol per tab.",
+        selected_symbol = st.session_state.get(
+            "live_technical_symbol",
+            live_input_default("live_technical_symbol", LIVE_TECHNICAL_SYMBOLS[0]),
         )
-        selected_symbols = [OPTIONS_SYMBOL_TICKER_BY_LABEL[selected_symbol_label]]
+        selected_symbol_label = OPTIONS_SYMBOL_LABEL_BY_TICKER[selected_symbol]
+        st.text_input(
+            "Symbol", value=selected_symbol_label, disabled=True,
+            help="Matches the Symbol selected in Technical Analysis above. Change it there.",
+        )
+        selected_symbols = [selected_symbol]
 
     with control_col2:
         selected_expiration_date = st.date_input(
